@@ -1,0 +1,73 @@
+name: Prepare GitHub release
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: Release channel
+        required: true
+        type: choice
+        options:
+          - alpha
+          - stable
+permissions:
+  contents: read
+concurrency:
+  group: prepare-release
+  cancel-in-progress: false
+jobs:
+  package:
+    if: github.ref == 'refs/heads/main'
+    strategy:
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5
+        with:
+          version: 2026.9.15
+      - run: mise run check
+      - run: mise exec -- bash .github/scripts/package-release.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-${{ matrix.os }}
+          path: target/dist/*.tar.gz
+          if-no-files-found: error
+
+  draft:
+    needs: package
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: package-*
+          path: dist
+          merge-multiple: true
+      - name: Create draft with binaries and checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHANNEL: ${{ inputs.channel }}
+        working-directory: dist
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("../Cargo.toml", "rb"))["package"]["version"])')
+          tag="v$version"
+          archives=(overgit-"$tag"-*.tar.gz)
+          test "${#archives[@]}" -eq 2
+          sha256sum "${archives[@]}" > SHA256SUMS
+          title="$tag"
+          flags=(--draft)
+          if [[ "$CHANNEL" == alpha ]]; then
+            title="$tag Alpha"
+            flags+=(--prerelease)
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag"; then
+            echo "Tag $tag already exists" >&2
+            exit 1
+          else
+            test "$?" -eq 2
+          fi
+          gh release create "$tag" --target "$GITHUB_SHA" --title "$title" \
+            --generate-notes "${flags[@]}" "${archives[@]}" SHA256SUMS

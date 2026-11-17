@@ -1,22 +1,14 @@
-name: Prepare GitHub release
+name: Release
 on:
-  workflow_dispatch:
-    inputs:
-      channel:
-        description: Release channel
-        required: true
-        type: choice
-        options:
-          - alpha
-          - stable
+  push:
+    tags: ["v*"]
 permissions:
   contents: read
 concurrency:
-  group: prepare-release
+  group: release-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   package:
-    if: github.ref == 'refs/heads/main'
     strategy:
       matrix:
         os: [ubuntu-24.04, macos-15]
@@ -34,7 +26,7 @@ jobs:
           path: target/dist/*.tar.gz
           if-no-files-found: error
 
-  draft:
+  publish:
     needs: package
     runs-on: ubuntu-24.04
     permissions:
@@ -46,28 +38,22 @@ jobs:
           pattern: package-*
           path: dist
           merge-multiple: true
-      - name: Create draft with binaries and checksums
+      - name: Publish binaries and checksums
         env:
           GH_TOKEN: ${{ github.token }}
-          CHANNEL: ${{ inputs.channel }}
         working-directory: dist
         run: |
           version=$(python3 -c 'import tomllib; print(tomllib.load(open("../Cargo.toml", "rb"))["package"]["version"])')
           tag="v$version"
+          if [[ "$tag" != "$GITHUB_REF_NAME" ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match package version $version"
+            exit 1
+          fi
           archives=(overgit-"$tag"-*.tar.gz)
           test "${#archives[@]}" -eq 2
           sha256sum "${archives[@]}" > SHA256SUMS
-          title="$tag"
-          flags=(--draft)
-          if [[ "$CHANNEL" == alpha ]]; then
-            title="$tag Alpha"
+          flags=(--verify-tag --generate-notes)
+          if [[ "${version%%+*}" == *-* ]]; then
             flags+=(--prerelease)
           fi
-          if git ls-remote --exit-code --tags origin "refs/tags/$tag"; then
-            echo "Tag $tag already exists" >&2
-            exit 1
-          else
-            test "$?" -eq 2
-          fi
-          gh release create "$tag" --target "$GITHUB_SHA" --title "$title" \
-            --generate-notes "${flags[@]}" "${archives[@]}" SHA256SUMS
+          gh release create "$tag" --title "$tag" "${flags[@]}" "${archives[@]}" SHA256SUMS

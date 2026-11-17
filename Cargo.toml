@@ -1,0 +1,39 @@
+[workspace]
+members = ["."]
+resolver = "3"
+
+[package]
+name = "overgit"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+description = "An independent Git overlay in a shared working tree"
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+anyhow = "1.0"
+base64 = "0.22"
+clap = { version = "4.6", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tempfile = "3.27"
+unicode-normalization = "0.1"
+
+[lints]
+workspace = true
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+undocumented_unsafe_blocks = "warn"
+todo = "warn"
+unimplemented = "warn"
+dbg_macro = "warn"
+let_underscore_must_use = "warn"
+allow_attributes_without_reason = "warn"

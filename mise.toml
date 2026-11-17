@@ -1,0 +1,18 @@
+[tools]
+rust = { version = "1.92.0", profile = "minimal", components = ["rustfmt", "clippy"] }
+
+[tasks.fmt]
+description = "Check Rust formatting"
+run = "cargo fmt --all -- --check"
+
+[tasks.test]
+description = "Run locked workspace tests"
+run = "cargo test --workspace --locked"
+
+[tasks.clippy]
+description = "Run Clippy with warnings denied"
+run = "cargo clippy --workspace --all-targets --locked -- -D warnings"
+
+[tasks.check]
+description = "Run the CI and pre-commit checks"
+run = [{ task = "fmt" }, { task = "test" }, { task = "clippy" }]

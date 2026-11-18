@@ -133,8 +133,11 @@ enum Command {
     /// Show both repositories and local overlay health; porcelain is JSON
     Status {
         #[arg(short, long, conflicts_with = "porcelain")]
-        /// Compact status output
+        /// Omit branch and summary lines
         short: bool,
+        #[arg(long, conflicts_with = "porcelain")]
+        /// Include unchanged owned paths
+        all: bool,
         #[arg(long)]
         /// Emit versioned JSON for both repositories and diagnostics
         porcelain: bool,
@@ -448,7 +451,11 @@ fn run(cli: Cli) -> Result<i32> {
     match cli.command {
         Command::List { kind, porcelain } => inspect::list(&repo, kind, porcelain),
         Command::Which { paths, porcelain } => inspect::which(&repo, &paths, porcelain),
-        Command::Status { short, porcelain } => inspect::status(&repo, short, porcelain),
+        Command::Status {
+            short,
+            all,
+            porcelain,
+        } => inspect::status(&repo, short, all, porcelain),
         Command::Diff { args } => pass(&repo, "diff", args),
         Command::Log { args } => pass(&repo, "log", args),
         Command::Fetch { args } => {

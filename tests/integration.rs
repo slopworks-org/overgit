@@ -1059,6 +1059,25 @@ mod tests {
     }
 
     #[test]
+    fn status_omits_unchanged_owned_paths_unless_requested() {
+        let sandbox = Sandbox::new(&[("hidden", b"base"), ("edited", b"base")]);
+        sandbox.init();
+        sandbox.run(&["rm", "hidden"]);
+        sandbox.run(&["add", "edited"]);
+        sandbox.run(&["commit", "-m", "overlay"]);
+        write(&sandbox.root, "edited", b"dirty");
+        for args in [vec!["status"], vec!["status", "--short"]] {
+            let output = String::from_utf8(sandbox.run(&args).stdout).unwrap();
+            assert!(!output.contains("\"hidden\""));
+            assert!(output.contains("\"edited\""));
+        }
+        for flag in ["--all", "--porcelain"] {
+            let output = String::from_utf8(sandbox.run(&["status", flag]).stdout).unwrap();
+            assert!(output.contains("\"hidden\""));
+        }
+    }
+
+    #[test]
     fn inspection_commands_work_from_subdirectories_and_global_directory_flag() {
         let sandbox = Sandbox::new(&[("config", b"base\n"), ("nested/base", b"base\n")]);
         sandbox.init();

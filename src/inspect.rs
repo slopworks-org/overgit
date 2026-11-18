@@ -189,7 +189,7 @@ fn pull_blocked(repo: &Repo, manifest: &Manifest, base: &Value) -> Result<Vec<St
     Ok(paths)
 }
 
-fn render_status(repo: &Repo, report: &Value, short: bool) -> Result<()> {
+fn render_status(repo: &Repo, report: &Value, short: bool, all: bool) -> Result<()> {
     let base = &report["base"];
     let overlay = &report["overlay"];
     let files = report["files"]
@@ -225,6 +225,15 @@ fn render_status(repo: &Repo, report: &Value, short: bool) -> Result<()> {
         }
     }
     for file in files {
+        if !all
+            && file["staged"] == false
+            && file["dirty"] == false
+            && file["missing"] == false
+            && file["blocked"] == false
+            && file["upstream"] == "same"
+        {
+            continue;
+        }
         crate::say!(
             "{:<8} {} {} {:<7} {:?}",
             file["kind"].as_str().unwrap_or("?"),
@@ -302,7 +311,7 @@ fn render_diagnostics(report: &Value) -> Result<()> {
     Ok(())
 }
 
-pub fn status(repo: &Repo, short: bool, porcelain: bool) -> Result<i32> {
+pub fn status(repo: &Repo, short: bool, all: bool, porcelain: bool) -> Result<i32> {
     let inspection = repo.for_inspection();
     let repo = &inspection;
     let manifest = repo.manifest()?;
@@ -352,7 +361,7 @@ pub fn status(repo: &Repo, short: bool, porcelain: bool) -> Result<i32> {
         serde_json::to_writer_pretty(&mut out, &report)?;
         writeln!(out)?;
     } else {
-        render_status(repo, &report, short)?;
+        render_status(repo, &report, short, all)?;
     }
     Ok(0)
 }

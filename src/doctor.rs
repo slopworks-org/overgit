@@ -226,11 +226,7 @@ fn context(repo: &Repo, problems: &mut Vec<Problem>) -> Result<()> {
             "run doctor --fix to restore the original state; changed bytes are rescued first",
         ));
     }
-    match crate::sync::pending_paths(repo) {
-        Ok(paths) if repo.local("sync.json").exists() => problems.push(problem("sync-in-progress", None, false, format!("sync has {} pending paths", paths.len()), "inspect with sync --dry-run or sync --inspect PATH; resolve and continue, or sync --abort")),
-        Err(error) => problems.push(problem("sync-state-invalid", None, false, error.to_string(), "preserve .overgit/local/sync.json and recover its snapshots before removing it")),
-        _ => {},
-    }
+    sync_context(repo, problems);
     match crate::pull::state_summary(repo) {
         Ok(Some(state)) => problems.push(problem(
             "pull-in-progress",
@@ -288,20 +284,39 @@ fn context(repo: &Repo, problems: &mut Vec<Problem>) -> Result<()> {
     {
         finding.severity = Severity::Info;
     }
-    if repo.local("sync.json").exists() {
-        let state =
-            serde_json::from_slice::<serde_json::Value>(&fs::read(repo.local("sync.json"))?);
-        if state.is_ok_and(|state| state["completed"] == false) {
+    Ok(())
+}
+
+fn sync_context(repo: &Repo, problems: &mut Vec<Problem>) {
+    let interrupted = crate::sync::is_interrupted(repo);
+    match crate::sync::pending_paths(repo) {
+        Ok(paths) if repo.local("sync.json").exists() && !interrupted => {
             problems.push(problem(
-                "sync-interrupted",
+                "sync-in-progress",
                 None,
                 false,
-                "sync stopped before applying its full plan",
-                "run sync --abort before retrying",
+                format!("sync has {} pending paths", paths.len()),
+                "inspect with sync --dry-run or sync --inspect PATH; resolve and continue, or sync --abort",
             ));
         }
+        Err(error) => problems.push(problem(
+            "sync-state-invalid",
+            None,
+            false,
+            error.to_string(),
+            "preserve .overgit/local/sync.json and recover its snapshots before removing it",
+        )),
+        _ => {}
     }
-    Ok(())
+    if interrupted {
+        problems.push(problem(
+            "sync-interrupted",
+            None,
+            false,
+            "sync stopped before applying its full plan",
+            "run sync --abort before retrying",
+        ));
+    }
 }
 
 fn recovery_entries(repo: &Repo) -> Result<(usize, usize)> {

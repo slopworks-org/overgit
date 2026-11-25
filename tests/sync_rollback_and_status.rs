@@ -93,9 +93,8 @@ mod tests {
         sandbox.git(&["commit", "-m", "upstream"]);
         sandbox.cli(&["attach"], 0);
 
-        // Make a non-file obstruction so sync fails mid-apply while base index remains unlocked.
-        fs::remove_file(sandbox.root.join("f")).unwrap();
-        sandbox.write("f", b"ours\nb\nc\n");
+        // Clear skip-worktree so sync must update the base index, then lock .git/index.lock.
+        sandbox.git(&["update-index", "--no-skip-worktree", "f"]);
         let lock = sandbox.root.join(".git/index.lock");
         fs::write(&lock, b"stale lock\n").unwrap();
 

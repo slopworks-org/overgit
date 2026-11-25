@@ -565,6 +565,7 @@ fn check_flags(
         }
     }
     if !repo.detached() {
+        let mut need_skip = Vec::new();
         for path in manifest.entries.keys() {
             if repo.index_file(path, false)?.is_some() && !hidden.contains(path) {
                 problems.push(problem(
@@ -575,10 +576,11 @@ fn check_flags(
                     "run doctor --fix",
                 ));
                 if fix {
-                    repo.skip(path, true)?;
+                    need_skip.push(path.as_str());
                 }
             }
         }
+        repo.skip_many(need_skip, true)?;
     }
     Ok(())
 }

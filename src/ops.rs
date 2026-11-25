@@ -320,8 +320,8 @@ pub fn add(repo: &Repo, inputs: &[PathBuf], force: bool) -> Result<i32> {
     let changed_paths: Vec<_> = content.iter().map(|(path, _)| path.clone()).collect();
     crate::mutation::run(repo, &changed_paths, || {
         atomic_write(&repo.common.join("info/exclude"), &protection)?;
+        repo.skip_many(content.iter().map(|(path, _)| path.as_str()), true)?;
         for (path, value) in &content {
-            repo.skip(path, true)?;
             rescue_index_before_replacing(repo, path, Some(value))?;
             repo.stage(path, value)?;
         }
@@ -400,14 +400,19 @@ pub fn remove(repo: &Repo, inputs: &[PathBuf], force: bool, action: Removal) -> 
     let protection = exclude_bytes(repo, Some(&manifest), true)?;
     let paths: Vec<_> = plans.iter().map(|(path, ..)| path.clone()).collect();
     crate::mutation::run(repo, &paths, || {
+        let (hide, unhide): (Vec<_>, Vec<_>) = plans
+            .iter()
+            .map(|(path, ..)| path.as_str())
+            .partition(|path| manifest.entries.contains_key(*path));
+        repo.skip_many(hide, true)?;
         for (path, value, backup, keep) in &plans {
             rescue_index_before_replacing(repo, path, None)?;
             if !keep {
                 repo.replace(path, value.as_ref(), *backup, force)?;
             }
             repo.unstage_path(path)?;
-            repo.skip(path, manifest.entries.contains_key(path))?;
         }
+        repo.skip_many(unhide, false)?;
         repo.save_manifest(&manifest)?;
         atomic_write(&repo.common.join("info/exclude"), &protection)
     })?;
@@ -487,9 +492,7 @@ pub fn reconcile(repo: &Repo, dry_run: bool, force: bool) -> Result<bool> {
     let changed = !plans.is_empty() || exclude_changed || flags_changed || repo.detached();
     if !dry_run {
         atomic_write(&repo.common.join("info/exclude"), &text)?;
-        for path in manifest.entries.keys() {
-            repo.skip(path, true)?;
-        }
+        repo.skip_many(manifest.entries.keys().map(String::as_str), true)?;
     }
     for (path, value, backup) in &plans {
         if dry_run {
@@ -548,11 +551,11 @@ pub fn detach(repo: &Repo, force: bool) -> Result<i32> {
     let mut plans = Vec::new();
     for (path, entry) in &manifest.entries {
         let work = repo.work(path)?;
+        let base = repo.indexed(path, false)?;
         ensure!(
-            entry.kind != Kind::Delete || work.is_none() || force,
+            entry.kind != Kind::Delete || work.is_none() || work == base || force,
             "whiteout {path:?} has unexpected content; use --force to rescue it"
         );
-        let base = repo.indexed(path, false)?;
         let saved = repo.indexed(path, true)?;
         let known_base = work.is_some() && (work == base || work == entry.base);
         let stage = entry.kind != Kind::Delete && work.is_some() && !(known_base && work != saved);
@@ -567,24 +570,23 @@ pub fn detach(repo: &Repo, force: bool) -> Result<i32> {
     let protection = exclude_bytes(repo, Some(&manifest), false)?;
     crate::mutation::run(repo, &paths, || {
         atomic_write(&repo.local("detached.json"), &serde_json::to_vec(&marker)?)?;
-        let mut restored = Vec::new();
         for (path, base, work, kind, stage) in &plans {
             if *stage && let Some(value) = work {
                 rescue_index_before_replacing(repo, path, Some(value))?;
                 repo.stage(path, value)?;
             }
-            repo.skip(path, false)?;
-            repo.replace(
-                path,
-                base.as_ref(),
-                *kind == Kind::Delete && work.is_some(),
-                force,
-            )?;
-            restored.push(path);
-            marker["restored"] = serde_json::to_value(&restored)?;
-            atomic_write(&repo.local("detached.json"), &serde_json::to_vec(&marker)?)?;
+            if work != base {
+                repo.replace(
+                    path,
+                    base.as_ref(),
+                    *kind == Kind::Delete && work.is_some(),
+                    force,
+                )?;
+            }
         }
+        repo.skip_many(paths.iter().map(String::as_str), false)?;
         atomic_write(&repo.common.join("info/exclude"), &protection)?;
+        marker["restored"] = serde_json::to_value(&paths)?;
         marker["complete"] = true.into();
         atomic_write(&repo.local("detached.json"), &serde_json::to_vec(&marker)?)
     })?;

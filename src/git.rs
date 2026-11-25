@@ -56,7 +56,19 @@ pub fn interactive_command(cwd: &Path) -> Command {
     scoped_command(cwd)
 }
 
-pub fn output(cmd: &mut Command, input: Option<&[u8]>) -> Result<Output> {
+const INDEX_LOCK_BACKOFF_MS: [u64; 5] = [15, 30, 60, 120, 200];
+
+fn is_index_lock_contention(output: &Output) -> bool {
+    if output.status.code() != Some(128) {
+        return false;
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    stderr.contains("Unable to create")
+        && stderr.contains("index.lock")
+        && stderr.contains("File exists")
+}
+
+fn output_once(cmd: &mut Command, input: Option<&[u8]>) -> Result<Output> {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     if input.is_some() {
         cmd.stdin(Stdio::piped());
@@ -72,11 +84,25 @@ pub fn output(cmd: &mut Command, input: Option<&[u8]>) -> Result<Output> {
             .write_all(input);
         if let Err(error) = result {
             let output = child.wait_with_output()?;
-            check(&output)?;
+            if !output.status.success() {
+                return Ok(output);
+            }
             return Err(error.into());
         }
     }
     Ok(child.wait_with_output()?)
+}
+
+pub fn output(cmd: &mut Command, input: Option<&[u8]>) -> Result<Output> {
+    let mut out = output_once(cmd, input)?;
+    for delay_ms in INDEX_LOCK_BACKOFF_MS {
+        if !is_index_lock_contention(&out) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        out = output_once(cmd, input)?;
+    }
+    Ok(out)
 }
 pub fn check(output: &Output) -> Result<()> {
     if !output.status.success() {

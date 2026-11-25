@@ -532,21 +532,60 @@ impl Repo {
         self.overlay(["update-index", "--force-remove", "--", path])?;
         Ok(())
     }
-    pub fn skip(&self, path: &str, hide: bool) -> Result<()> {
-        if self.index_file(path, false)?.is_some() {
-            self.base(["update-index", "--no-assume-unchanged", "--", path])?;
-            self.base([
-                "update-index",
-                if hide {
-                    "--skip-worktree"
-                } else {
-                    "--no-skip-worktree"
-                },
-                "--",
-                path,
-            ])?;
+    pub fn set_base_flags<'a>(
+        &self,
+        updates: impl IntoIterator<Item = (&'a str, bool, bool)>,
+    ) -> Result<()> {
+        let wanted: BTreeMap<_, _> = updates.into_iter().map(|(p, s, a)| (p, (s, a))).collect();
+        if wanted.is_empty() {
+            return Ok(());
+        }
+        let flags = self.base(["ls-files", "-v", "-z"])?;
+        let mut buckets: [Vec<u8>; 4] = Default::default();
+        for row in flags.split(|byte| *byte == 0).filter(|row| !row.is_empty()) {
+            let Some(path) = row.get(2..).and_then(|b| std::str::from_utf8(b).ok()) else {
+                continue;
+            };
+            let Some(&(want_skip, want_assume)) = wanted.get(path) else {
+                continue;
+            };
+            if row[0].is_ascii_lowercase() != want_assume {
+                let buf = &mut buckets[usize::from(want_assume)];
+                buf.extend_from_slice(path.as_bytes());
+                buf.push(0);
+            }
+            if row[0].eq_ignore_ascii_case(&b'S') != want_skip {
+                let buf = &mut buckets[2 + usize::from(!want_skip)];
+                buf.extend_from_slice(path.as_bytes());
+                buf.push(0);
+            }
+        }
+        let options = [
+            "--no-assume-unchanged",
+            "--assume-unchanged",
+            "--skip-worktree",
+            "--no-skip-worktree",
+        ];
+        for (option, input) in options.into_iter().zip(buckets) {
+            if !input.is_empty() {
+                git::check(&git::output(
+                    self.base_cmd()
+                        .args(["update-index", option, "-z", "--stdin"]),
+                    Some(&input),
+                )?)?;
+            }
         }
         Ok(())
+    }
+    pub fn skip_many<'a>(
+        &self,
+        paths: impl IntoIterator<Item = &'a str>,
+        hide: bool,
+    ) -> Result<()> {
+        self.set_base_flags(paths.into_iter().map(|path| (path, hide, false)))
+    }
+    pub fn skip(&self, path: &str, hide: bool) -> Result<()> {
+        self.skip_many([path], hide)
     }
     pub fn staged_base_safe(&self, path: &str) -> Result<()> {
         let bytes = self.base(["diff", "--cached", "--name-only", "-z", "--", path])?;

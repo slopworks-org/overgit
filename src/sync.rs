@@ -271,35 +271,11 @@ fn base_flags(
 }
 
 fn restore_flags(repo: &Repo, flags: &BTreeMap<String, BaseFlags>) -> Result<()> {
-    for (path, flag) in flags {
-        if repo
-            .base(["ls-files", "--cached", "-z", "--", path])?
-            .is_empty()
-        {
-            continue;
-        }
-        repo.base([
-            "update-index",
-            if flag.skip {
-                "--skip-worktree"
-            } else {
-                "--no-skip-worktree"
-            },
-            "--",
-            path,
-        ])?;
-        repo.base([
-            "update-index",
-            if flag.assume {
-                "--assume-unchanged"
-            } else {
-                "--no-assume-unchanged"
-            },
-            "--",
-            path,
-        ])?;
-    }
-    Ok(())
+    repo.set_base_flags(
+        flags
+            .iter()
+            .map(|(path, flag)| (path.as_str(), flag.skip, flag.assume)),
+    )
 }
 
 pub(crate) fn upstream(repo: &Repo, path: &str) -> Result<Option<Snapshot>> {

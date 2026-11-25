@@ -92,10 +92,14 @@ fn capture(repo: &Repo, paths: &[String]) -> Result<Before> {
     }
     let mut work = BTreeMap::new();
     let mut flags = BTreeMap::new();
+    let base_flags_raw = repo.base(["ls-files", "-v", "-z"])?;
+    let base_flags: BTreeMap<&[u8], u8> = base_flags_raw
+        .split(|byte| *byte == 0)
+        .filter_map(|row| Some((row.get(2..)?, *row.first()?)))
+        .collect();
     for path in paths {
         work.insert(path.clone(), repo.work(path)?);
-        let bytes = repo.base(["ls-files", "-v", "-z", "--", path])?;
-        flags.insert(path.clone(), bytes.first().copied());
+        flags.insert(path.clone(), base_flags.get(path.as_bytes()).copied());
     }
     Ok(Before {
         version: 1,
@@ -212,9 +216,14 @@ pub fn recover(repo: &Repo) -> Result<()> {
     let protection = recovery_protection(repo, &state)?;
     let exclude = crate::ops::exclude_bytes(repo, Some(&protection), !repo.detached())?;
     atomic_write(&repo.common.join("info/exclude"), &exclude)?;
+    let current_raw = repo.base(["ls-files", "-v", "-z"])?;
+    let current_paths: std::collections::BTreeSet<&[u8]> = current_raw
+        .split(|byte| *byte == 0)
+        .filter_map(|row| row.get(2..))
+        .collect();
+    let mut flag_updates = Vec::new();
     for (path, flag) in &state.flags {
-        let current = repo.base(["ls-files", "-v", "-z", "--", path])?;
-        if current.is_empty() {
+        if !current_paths.contains(path.as_bytes()) {
             continue;
         }
         let Some(flag) = flag else {
@@ -222,27 +231,13 @@ pub fn recover(repo: &Repo) -> Result<()> {
                 "base started tracking {path:?} while recovery was pending; resolve it explicitly"
             );
         };
-        repo.base([
-            "update-index",
-            if flag.eq_ignore_ascii_case(&b'S') {
-                "--skip-worktree"
-            } else {
-                "--no-skip-worktree"
-            },
-            "--",
-            path,
-        ])?;
-        repo.base([
-            "update-index",
-            if flag.is_ascii_lowercase() {
-                "--assume-unchanged"
-            } else {
-                "--no-assume-unchanged"
-            },
-            "--",
-            path,
-        ])?;
+        flag_updates.push((
+            path.as_str(),
+            flag.eq_ignore_ascii_case(&b'S'),
+            flag.is_ascii_lowercase(),
+        ));
     }
+    repo.set_base_flags(flag_updates)?;
     fs::remove_file(repo.local("mutation.json"))?;
     Ok(())
 }

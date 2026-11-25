@@ -221,7 +221,14 @@ fn render_status(repo: &Repo, report: &Value, short: bool, all: bool) -> Result<
             crate::say!("isolated pull pending; use pull --status, --continue or --abort");
         }
         if report["sync_in_progress"] == true {
-            crate::say!("sync in progress; resolve, then sync --continue or --abort");
+            crate::say!(
+                "{}",
+                if crate::sync::is_interrupted(repo) {
+                    "sync was interrupted; run `overgit sync --abort` before retrying"
+                } else {
+                    "sync in progress; resolve, then sync --continue or --abort"
+                }
+            );
         }
     }
     for file in files {
@@ -259,15 +266,7 @@ fn render_status(repo: &Repo, report: &Value, short: bool, all: bool) -> Result<
             change["path"].as_str().unwrap_or("?")
         );
     }
-    for path in report["pull_blocked"]
-        .as_array()
-        .context("pull warnings are missing")?
-    {
-        crate::say!(
-            "base upstream touches owned path {:?}; detach before pulling",
-            path.as_str().unwrap_or("?")
-        );
-    }
+    render_pull_blocked(report)?;
     for path in report["sync_pending"]
         .as_array()
         .context("sync paths are missing")?
@@ -280,6 +279,26 @@ fn render_status(repo: &Repo, report: &Value, short: bool, all: bool) -> Result<
             "{} owned paths; {} base worktrees",
             files.len(),
             ops::worktree_roots(repo)?.len()
+        );
+    }
+    Ok(())
+}
+
+fn render_pull_blocked(report: &Value) -> Result<()> {
+    const MAX_LINES: usize = 10;
+    let blocked = report["pull_blocked"]
+        .as_array()
+        .context("pull warnings are missing")?;
+    for path in blocked.iter().take(MAX_LINES) {
+        crate::say!(
+            "base upstream touches owned path {:?}; detach before pulling",
+            path.as_str().unwrap_or("?")
+        );
+    }
+    if blocked.len() > MAX_LINES {
+        crate::say!(
+            "... and {} more owned paths touched by base upstream; detach before pulling",
+            blocked.len() - MAX_LINES
         );
     }
     Ok(())
@@ -329,8 +348,14 @@ pub fn status(repo: &Repo, short: bool, all: bool, porcelain: bool) -> Result<i3
     warnings.extend(
         problems
             .iter()
-            .filter(|problem| problem.severity == crate::doctor::Severity::Warning)
-            .map(|problem| format!("{} {}", problem.code, problem.message)),
+            .filter(|problem| {
+                problem.severity == crate::doctor::Severity::Warning
+                    && problem.code != "base-pull-owned"
+            })
+            .map(|problem| match &problem.path {
+                Some(path) => format!("{} {path:?} {}", problem.code, problem.message),
+                None => format!("{} {}", problem.code, problem.message),
+            }),
     );
     let changes = base_changes(repo, &manifest, &mut warnings)?;
     let blocked = pull_blocked(repo, &manifest, &base)?;

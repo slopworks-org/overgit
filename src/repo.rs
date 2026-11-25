@@ -2,7 +2,7 @@ use crate::{
     git,
     model::{MANIFEST, Manifest, Snapshot, path_identity, validate_path},
 };
-use anyhow::{Context as _, Result, ensure};
+use anyhow::{Context as _, Result, bail, ensure};
 use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet},
@@ -241,10 +241,13 @@ impl Repo {
         Ok(())
     }
     pub fn assert_no_sync(&self) -> Result<()> {
-        ensure!(
-            !self.local("sync.json").exists(),
-            "sync in progress; resolve and continue, or abort it first"
-        );
+        if self.local("sync.json").exists() {
+            ensure!(
+                !crate::sync::is_interrupted(self),
+                "sync was interrupted; run `overgit sync --abort` before retrying"
+            );
+            bail!("sync in progress; resolve and continue, or abort it first");
+        }
         Ok(())
     }
     pub fn manifest(&self) -> Result<Manifest> {

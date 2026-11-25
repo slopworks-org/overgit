@@ -577,6 +577,13 @@ fn preview_pending(state: &State, only: &[String]) -> Result<i32> {
     Ok(if pending { 4 } else { 0 })
 }
 
+pub(crate) fn is_interrupted(repo: &Repo) -> bool {
+    fs::read(repo.local("sync.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .is_some_and(|state| state["completed"] == false)
+}
+
 fn apply_plans(repo: &Repo, plans: Vec<Planned>) -> Result<i32> {
     let mut state = original_state(
         repo,
@@ -591,6 +598,18 @@ fn apply_plans(repo: &Repo, plans: Vec<Planned>) -> Result<i32> {
         }
     }
     save_state(repo, &state)?;
+    match apply_plans_inner(repo, plans, &mut state) {
+        Ok(code) => Ok(code),
+        Err(error) => match abort(repo) {
+            Ok(_) => Err(error.context("sync failed and was rolled back")),
+            Err(rollback) => Err(error.context(format!(
+                "sync failed and rollback was incomplete ({rollback:#}); run `overgit sync --abort` after removing the obstruction"
+            ))),
+        },
+    }
+}
+
+fn apply_plans_inner(repo: &Repo, plans: Vec<Planned>, state: &mut State) -> Result<i32> {
     let mut manifest = repo.manifest()?;
     for plan in plans {
         match plan.action {
@@ -630,15 +649,15 @@ fn apply_plans(repo: &Repo, plans: Vec<Planned>) -> Result<i32> {
                 );
             }
         }
-        repo.save_manifest(&manifest)?;
     }
-    crate::ops::refresh_excludes(repo)?;
-    state.completed = true;
-    save_state(repo, &state)?;
+    repo.save_manifest(&manifest)?;
     if state.pending.is_empty() {
         finish(repo)?;
         Ok(0)
     } else {
+        crate::ops::refresh_excludes(repo)?;
+        state.completed = true;
+        save_state(repo, state)?;
         Ok(3)
     }
 }

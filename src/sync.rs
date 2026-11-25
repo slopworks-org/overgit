@@ -5,7 +5,12 @@ use crate::{
 };
 use anyhow::{Context as _, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, fs, io::Write as _, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    io::Write as _,
+    path::PathBuf,
+};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -49,6 +54,8 @@ struct State {
     indexed: BTreeMap<String, Snapshot>,
     shared_index: Option<SharedIndex>,
     work: BTreeMap<String, Option<Snapshot>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    directories: BTreeMap<String, bool>,
     base_flags: BTreeMap<String, BaseFlags>,
     pending: BTreeMap<String, Pending>,
 }
@@ -56,6 +63,7 @@ struct State {
 enum Action {
     None,
     Missing,
+    Hide,
     Update(Entry, Option<Snapshot>),
     Pending(Pending, Option<Snapshot>),
     Drop,
@@ -82,6 +90,7 @@ fn read_state(repo: &Repo) -> Result<Option<State>> {
     );
     let manifest: Manifest = serde_json::from_slice(&state.manifest.data)?;
     manifest.validate()?;
+    let repo = &repo.with_layout(state.work.keys().chain(manifest.entries.keys()));
     for snapshot in state.indexed.values() {
         snapshot.validate()?;
     }
@@ -90,7 +99,7 @@ fn read_state(repo: &Repo) -> Result<Option<State>> {
         shared.snapshot.validate()?;
     }
     for (path, snapshot) in &state.work {
-        repo.safe_path(path)?;
+        repo.validate_leaf(path)?;
         if let Some(snapshot) = snapshot {
             snapshot.validate()?;
         }
@@ -143,6 +152,7 @@ fn original_state(repo: &Repo, work: BTreeMap<String, Option<Snapshot>>) -> Resu
         indexed: indexed_content(repo)?,
         shared_index: shared_index(repo)?,
         base_flags: base_flags(repo, &work)?,
+        directories: crate::mutation::directory_state(repo, work.keys())?,
         work,
         pending: BTreeMap::new(),
     })
@@ -296,8 +306,12 @@ pub(crate) fn upstream(repo: &Repo, path: &str) -> Result<Option<Snapshot>> {
         .context("invalid tree record")?;
     let mut fields = std::str::from_utf8(&record[..tab])?.split_whitespace();
     let mode = fields.next().context("tree mode missing")?.to_owned();
+    let object_type = fields.next();
+    if object_type == Some("tree") && repo.file_or_directory(path) {
+        return Ok(None);
+    }
     ensure!(
-        fields.next() == Some("blob"),
+        object_type == Some("blob"),
         "base path {path:?} is not a file"
     );
     let oid = fields.next().context("tree oid missing")?;
@@ -487,18 +501,48 @@ fn plans(repo: &Repo, only: &[String], style: &str) -> Result<Vec<Planned>> {
         "invalid conflict style {style:?}"
     );
     let manifest = repo.manifest()?;
+    let files = repo.managed_files(&manifest)?;
+    let staged = repo.staged_opaque_files(&manifest)?;
+    let repo = &repo.with_layout(files.keys());
     for path in only {
         ensure!(
-            manifest.entries.contains_key(path),
+            files.contains_key(path) || manifest.opaque.contains(path),
             "overlay does not own {path:?}"
         );
     }
-    manifest
-        .entries
-        .iter()
-        .filter(|(path, _)| only.is_empty() || only.contains(path))
-        .map(|(path, entry)| plan(repo, path, entry, style))
+    let skipped = if manifest.opaque.is_empty() {
+        BTreeSet::new()
+    } else {
+        repo.skipped()?
+    };
+    files
+        .into_keys()
+        .filter(|path| selected(&manifest, only, path))
+        .map(|path| {
+            if let Some(entry) = manifest.entries.get(&path) {
+                return plan(repo, &path, entry, style);
+            }
+            let before = repo.work(&path)?;
+            let action = if before.is_some() || !skipped.contains(&path) {
+                ensure!(!staged.contains(&path), "base has staged changes at {path:?}; commit or unstage them before syncing the directory mask");
+                Action::Hide
+            } else {
+                Action::None
+            };
+            Ok(Planned {
+                path,
+                before,
+                action,
+            })
+        })
         .collect()
+}
+
+fn selected(manifest: &Manifest, only: &[String], path: &str) -> bool {
+    only.is_empty()
+        || only
+            .iter()
+            .any(|p| p == path || Some(p.as_str()) == manifest.opaque_directory(path))
 }
 
 fn finish(repo: &Repo) -> Result<()> {
@@ -555,9 +599,15 @@ pub fn run(repo: &Repo, only: &[String], style: &str, dry_run: bool) -> Result<i
 }
 
 fn preview_pending(state: &State, only: &[String]) -> Result<i32> {
+    let manifest: Manifest = serde_json::from_slice(&state.manifest.data)?;
     for path in only {
         ensure!(
-            state.work.contains_key(path),
+            state.work.contains_key(path)
+                || (manifest.opaque.contains(path)
+                    && state
+                        .work
+                        .keys()
+                        .any(|p| manifest.opaque_directory(p) == Some(path.as_str()))),
             "path {path:?} is outside the pending sync"
         );
     }
@@ -569,7 +619,7 @@ fn preview_pending(state: &State, only: &[String]) -> Result<i32> {
     for path in state
         .pending
         .keys()
-        .filter(|path| only.is_empty() || only.contains(path))
+        .filter(|path| selected(&manifest, only, path))
     {
         crate::say!("pending\t{path:?}; inspect it, then resolve or abort");
         pending = true;
@@ -585,6 +635,13 @@ pub(crate) fn is_interrupted(repo: &Repo) -> bool {
 }
 
 fn apply_plans(repo: &Repo, plans: Vec<Planned>) -> Result<i32> {
+    let manifest = repo.manifest()?;
+    let repo = &repo.with_layout(
+        plans
+            .iter()
+            .map(|plan| &plan.path)
+            .chain(manifest.entries.keys()),
+    );
     let mut state = original_state(
         repo,
         plans
@@ -611,9 +668,30 @@ fn apply_plans(repo: &Repo, plans: Vec<Planned>) -> Result<i32> {
 
 fn apply_plans_inner(repo: &Repo, plans: Vec<Planned>, state: &mut State) -> Result<i32> {
     let mut manifest = repo.manifest()?;
+    let update_manifest = plans.iter().any(|p| {
+        matches!(
+            p.action,
+            Action::Drop | Action::Update(..) | Action::Pending(..)
+        )
+    });
+    repo.skip_many(
+        plans
+            .iter()
+            .filter(|p| matches!(p.action, Action::Hide))
+            .map(|p| p.path.as_str()),
+        true,
+    )?;
     for plan in plans {
         match plan.action {
             Action::None | Action::Missing => {}
+            Action::Hide => {
+                if plan.before.is_some() {
+                    let backup = plan.before != repo.indexed(&plan.path, false)?;
+                    repo.replace(&plan.path, None, backup, false)?;
+                    crate::ops::prune_opaque_parents(repo, &manifest, &plan.path)?;
+                }
+                crate::say!("hid {:?}", plan.path);
+            }
             Action::Drop => {
                 rescue_index(repo, &plan.path, None)?;
                 manifest.entries.remove(&plan.path);
@@ -650,7 +728,9 @@ fn apply_plans_inner(repo: &Repo, plans: Vec<Planned>, state: &mut State) -> Res
             }
         }
     }
-    repo.save_manifest(&manifest)?;
+    if update_manifest {
+        repo.save_manifest(&manifest)?;
+    }
     if state.pending.is_empty() {
         finish(repo)?;
         Ok(0)
@@ -683,6 +763,8 @@ pub fn continue_sync(repo: &Repo) -> Result<i32> {
 
 pub fn abort(repo: &Repo) -> Result<i32> {
     let state = read_state(repo)?.context("no sync is in progress")?;
+    let manifest: Manifest = serde_json::from_slice(&state.manifest.data)?;
+    let repo = &repo.with_layout(state.work.keys().chain(manifest.entries.keys()));
     let index = index_path(repo)?;
     let _index_guard = crate::mutation::GitIndexLock::acquire(index.with_file_name("index.lock"))?;
     restore_shared_index(repo, state.shared_index.as_ref())?;
@@ -692,10 +774,7 @@ pub fn abort(repo: &Repo) -> Result<i32> {
     {
         repo.rescue(MANIFEST, &current)?;
     }
-    for (path, before) in &state.work {
-        let current = repo.work(path)?;
-        repo.replace(path, before.as_ref(), current != *before, false)?;
-    }
+    crate::mutation::recover_work(repo, &state.work, &state.directories)?;
     atomic_write(&repo.root.join(MANIFEST), &state.manifest.data)?;
     atomic_write(&index, &state.index.data)?;
     restore_flags(repo, &state.base_flags)?;
@@ -872,20 +951,24 @@ pub fn resolve(repo: &Repo, paths: &[String], decision: Option<&str>, force: boo
     }
     save_state(repo, &state)?;
     let mut manifest = repo.manifest()?;
-    for (path, (value, remaining)) in values {
+    for (path, (mut value, remaining)) in values {
         let pending = state
             .pending
             .get(&path)
             .context("resolution disappeared")?
             .clone();
-        rescue_index(repo, &path, value.as_ref())?;
-        if matches!(decision, Some("drop"))
+        let drop = matches!(decision, Some("drop"))
             || (matches!(pending.situation, Situation::Deleted | Situation::Collision)
-                && matches!(decision, Some("take-upstream")))
-        {
+                && matches!(decision, Some("take-upstream")));
+        let hidden = drop && manifest.opaque_directory(&path).is_some();
+        if hidden {
+            value = None;
+        }
+        rescue_index(repo, &path, value.as_ref())?;
+        if drop {
             manifest.entries.remove(&path);
             repo.unstage_path(&path)?;
-            repo.skip(&path, false)?;
+            repo.skip(&path, hidden)?;
         } else {
             let kind = if matches!(pending.situation, Situation::Whiteout) {
                 Kind::Delete
@@ -906,6 +989,9 @@ pub fn resolve(repo: &Repo, paths: &[String], decision: Option<&str>, force: boo
         }
         rescue_resolution(repo, &path, &pending, value.as_ref(), decision)?;
         repo.replace(&path, value.as_ref(), false, false)?;
+        if hidden {
+            crate::ops::prune_opaque_parents(repo, &manifest, &path)?;
+        }
         if let Some(situation) = remaining {
             state.pending.insert(
                 path.clone(),

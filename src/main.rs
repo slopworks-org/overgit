@@ -13,7 +13,6 @@ mod sync;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use model::Kind;
 use repo::Repo;
 use std::{
     path::PathBuf,
@@ -46,7 +45,7 @@ struct Cli {
 enum Command {
     /// Create an empty overlay in the current base repository
     #[command(
-        long_about = "Create an empty overlay in the current base repository\n\nRun inside an existing base Git worktree. One overlay per worktree; bare\nrepositories, sparse checkout and submodule overlays are unsupported. The\noverlay lives in .overgit and is excluded from base Git.\n\nExample:\n  overgit init --remote <overlay-url>\n  overgit add config.toml personal.sh\n  overgit commit -m \"personal setup\"\n  overgit push -u origin main\n\nOverrides and hidden base files include their original base contents in overlay\nhistory. Share the overlay only with people allowed to read those contents.\nKeep important overlay commits pushed; git clean -xffd can delete .overgit and\nlocal recovery data."
+        long_about = "Create an empty overlay in the current base repository\n\nRun inside an existing base Git worktree. One overlay per worktree; bare\nrepositories, sparse checkout and submodule overlays are unsupported. The\noverlay lives in .overgit and is excluded from base Git.\n\nExample:\n  overgit init --remote <overlay-url>\n  overgit add config.toml personal.sh\n  overgit commit -m \"personal setup\"\n  overgit push -u origin main\n\nOverrides and single-file whiteouts include original base contents in overlay\nhistory. Share the overlay only with people allowed to read those contents.\nKeep important overlay commits pushed; git clean -xffd can delete .overgit and\nlocal recovery data."
     )]
     Init {
         #[arg(long, help = "Set the overlay origin URL")]
@@ -70,7 +69,7 @@ enum Command {
     },
     /// Own files or recursive directories and immediately stage their content
     #[command(
-        long_about = "Own files or recursive directories and immediately stage their content\n\nPaths are relative to the invocation directory. Directories are recursive;\nregular files, executable files and symlink leaves are supported. Existing\nownership is skipped unless --force is given. Base-tracked files become\noverrides, other files become additions.\n\nStaged base changes at target paths must be resolved first. Symlink parents,\nnested repositories, non-UTF-8 ownership and case/Unicode-equivalent aliases\nare rejected. Added paths cannot contain newline or end in CR. Reserved aliases\nare ignored by base Git, including in sibling worktrees."
+        long_about = "Own files or recursive directories and immediately stage their content\n\nPaths are relative to the invocation directory. Directories are recursive;\nregular files, executable files and symlink leaves are supported. Existing\nownership is skipped unless --force is given. Base-tracked files become\noverrides, other files become additions. After rm DIR, create your replacement\nfiles and add them here. Other base files under DIR stay hidden.\n\nStaged base changes at target paths must be resolved first. Symlink parents,\nnested repositories, non-UTF-8 ownership and case/Unicode-equivalent aliases\nare rejected. Added paths cannot contain newline or end in CR. Reserved aliases\nare ignored by base Git, including in sibling worktrees."
     )]
     Add {
         #[arg(
@@ -82,9 +81,9 @@ enum Command {
         #[arg(required = true)]
         paths: Vec<PathBuf>,
     },
-    /// Hide base files or remove overlay additions
+    /// Hide base files, make directories opaque, or remove overlay additions
     #[command(
-        long_about = "Hide base files or remove overlay additions\n\nBase files become whiteouts, meaning they stay hidden while the overlay is\nattached. Overlay additions are removed. Use restore to relinquish ownership\ninstead. Original base contents remain in overlay history; hiding a file does\nnot remove its history."
+        long_about = "Hide base files, make directories opaque, or remove overlay additions\n\nA base file becomes a whiteout. Removing a directory makes it opaque. Attach, apply, and sync\nhide the current base files beneath it, including new files from upstream.\nUntracked files are preserved.\n\nTo replace a project directory with your own files:\n  overgit rm .agents\n  # Create your replacement files in .agents/\n  overgit add .agents\n  overgit commit -m \"replace project agents\"\n\nRemoving a replacement hides the base file again. Use overgit restore .agents\nto remove the directory rule and restore the current base files."
     )]
     Rm {
         #[arg(short, long, help = "Back up uncommitted content before removing it")]
@@ -94,7 +93,7 @@ enum Command {
     },
     /// Give paths back to the base
     #[command(
-        long_about = "Give paths back to the base\n\nRelinquishes ownership and restores base content. Overlay additions are removed\nunless --keep-file is given. This is not backup restoration; use overgit\nrecovery restore for saved recovery entries."
+        long_about = "Give paths back to the base\n\nRelinquishes ownership and restores base content. Overlay additions are removed\nunless --keep-file is given. To release an opaque directory and its replacements, run\n  overgit restore .agents\nThis restores all current base files in .agents.\nRestoring one replacement inside it leaves the directory rule in effect.\nFor a backup, use overgit recovery restore."
     )]
     Restore {
         #[arg(short, long, help = "Back up uncommitted content before replacing it")]
@@ -107,7 +106,7 @@ enum Command {
         all: bool,
         #[arg(
             long,
-            help = "Leave overlay additions as untracked files visible to base Git"
+            help = "Keep overlay additions in the working tree unless a directory mask hides the base file"
         )]
         keep_file: bool,
         #[arg(required_unless_present = "all")]
@@ -115,14 +114,15 @@ enum Command {
     },
     /// List paths owned by the overlay
     List {
-        #[arg(long, value_enum)]
+        #[arg(long, value_parser = ["add", "override", "delete", "opaque"])]
         /// Filter by ownership kind
-        kind: Option<Kind>,
+        kind: Option<String>,
         #[arg(long)]
         /// Emit tab-separated, NUL-terminated records with the path last
         porcelain: bool,
     },
     /// Report ownership; exit 1 if any path is outside the overlay
+    #[command(visible_alias = "inspect")]
     Which {
         #[arg(long)]
         /// Emit tab-separated, NUL-terminated records with the path last
@@ -205,7 +205,7 @@ enum Command {
     /// Rebuild overlay files and local Git state; attach remounts a detached overlay
     #[command(alias = "attach")]
     #[command(
-        long_about = "Rebuild overlay files and local Git state; attach remounts a detached overlay\n\nAlso available as attach. Restores saved overlay bytes and local Git state.\nModified owned files are backed up before replacement. Use doctor --fix to\nrepair drift while preserving ordinary edits.\n\nBase update workflow:\n  overgit detach\n  git pull\n  overgit attach\n  overgit sync\n\nGit clean -xfd or stash -a can remove additions; apply restores saved content.\nGit clean -xffd can delete the overlay itself and its backups."
+        long_about = "Rebuild overlay files and local Git state; attach remounts a detached overlay\n\nAlso available as attach. Restores saved overlay bytes and local Git state.\nAttach also hides current base files under opaque directories.\nModified owned files are backed up before replacement. Use doctor --fix to\nrepair drift while preserving ordinary edits.\n\nBase update workflow:\n  overgit detach\n  git pull\n  overgit attach\n  overgit sync\n\nGit clean -xfd or stash -a can remove additions; apply restores saved content.\nGit clean -xffd can delete the overlay itself and its backups."
     )]
     Apply {
         #[arg(
@@ -217,7 +217,7 @@ enum Command {
         #[arg(
             short,
             long,
-            help = "Move obstructing directories into recovery backups"
+            help = "Move obstructing directories into recovery backups when attached without directory masks"
         )]
         force: bool,
     },
@@ -235,7 +235,7 @@ enum Command {
     },
     /// Three-way merge current base revisions into the overlay
     #[command(
-        long_about = "Three-way merge current base revisions into the overlay\n\nAfter detach, updating base Git, and attach, merge current base HEAD changes\ninto owned files. Text conflicts get markers; binary, symlink, deletion and\naddition collisions require explicit decisions.\n\n  overgit sync --dry-run\n  overgit sync\n  overgit resolve <path>          After editing conflict markers\n  overgit resolve --keep <path>   Keep your version\n  overgit sync --continue\n\nUse resolve --help for other decisions. --abort restores pre-sync state and\nrescues edits made during resolution. Exit 3 means pending decisions; exit 4\ncan mean missing local inputs, requiring apply first. Finish or abort sync\nbefore commit, detach, apply or pull."
+        long_about = "Three-way merge current base revisions into the overlay\n\nAfter detach, updating base Git, and attach, merge current base HEAD changes\ninto owned files. Sync hides new base files under opaque directories and\nmerges changes to explicit replacements. Text conflicts get markers; binary, symlink, deletion and\naddition collisions require explicit decisions.\n\n  overgit sync --dry-run\n  overgit sync\n  overgit resolve <path>          After editing conflict markers\n  overgit resolve --keep <path>   Keep your version\n  overgit sync --continue\n\nUse resolve --help for other decisions. --abort restores pre-sync state and\nrescues edits made during resolution. Exit 3 means pending decisions; exit 4\ncan mean missing local inputs, requiring apply first. Finish or abort sync\nbefore commit, detach, apply or pull."
     )]
     Sync {
         #[arg(short = 'n', long, conflicts_with_all = ["cont", "abort"])]
@@ -248,7 +248,7 @@ enum Command {
         /// Restore pre-sync state, rescuing newer edits first
         abort: bool,
         #[arg(long, conflicts_with_all = ["cont", "abort"])]
-        /// Limit synchronization to this path; repeat for multiple paths
+        /// Sync one file or opaque directory; repeat for multiple paths
         only: Vec<PathBuf>,
         #[arg(long, conflicts_with_all = ["dry_run", "cont", "abort", "only"])]
         /// Print JSON snapshots for a pending path decision
@@ -282,7 +282,7 @@ enum Command {
     },
     /// Diagnose local state; fix repairs safe drift while retaining normal edits
     #[command(
-        long_about = "Diagnose local state; fix repairs safe drift while retaining normal edits\n\nUse doctor --fix after an interrupted mutation. Safe repairs preserve normal\nlocal edits; apply instead restores saved bytes. Recovery refuses to overwrite\na changed HEAD or unresolved external overlay merge.\n\n--rebuild explicitly reconstructs lost ownership and resets unknown fork\npoints. Lost whiteouts require surviving manifest/history. Recovery entries are\nreported without reading or validating payloads; inspect them with recovery\ninspect. Warnings exit 4; informational context does not fail the command."
+        long_about = "Diagnose local state; fix repairs safe drift while retaining normal edits\n\nUse doctor --fix after an interrupted mutation. Safe repairs preserve normal\nlocal edits; apply instead restores saved bytes. Recovery refuses to overwrite\na changed HEAD or unresolved external overlay merge.\n\n--rebuild explicitly reconstructs lost ownership and resets unknown fork\npoints. Recovering whiteouts and opaque directory rules requires a surviving\nmanifest or a copy from overlay history. Recovery entries are\nreported without reading or validating payloads; inspect them with recovery\ninspect. Warnings exit 4; informational context does not fail the command."
     )]
     Doctor {
         #[arg(long, help = "Repair safe drift and recover interrupted mutations")]
@@ -449,7 +449,7 @@ fn run(cli: Cli) -> Result<i32> {
     }
     repo.require_overlay()?;
     match cli.command {
-        Command::List { kind, porcelain } => inspect::list(&repo, kind, porcelain),
+        Command::List { kind, porcelain } => inspect::list(&repo, kind.as_deref(), porcelain),
         Command::Which { paths, porcelain } => inspect::which(&repo, &paths, porcelain),
         Command::Status {
             short,

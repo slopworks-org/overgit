@@ -230,6 +230,7 @@ fn materialize_manifest(repo: &Repo) -> Result<()> {
     );
     let manifest: Manifest = serde_json::from_slice(&snapshot.data)?;
     manifest.validate()?;
+    let repo = &repo.with_layout(repo.managed_files(&manifest)?.keys());
     let index = repo.index(true)?;
     for path in index.keys() {
         if path == MANIFEST {
@@ -243,10 +244,10 @@ fn materialize_manifest(repo: &Repo) -> Result<()> {
             entry.kind != Kind::Delete,
             "overlay tracks a whiteout at {path:?}"
         );
-        repo.safe_path(path)?;
+        repo.validate_leaf(path)?;
     }
     for (path, entry) in &manifest.entries {
-        repo.safe_path(path)?;
+        repo.validate_leaf(path)?;
         if entry.kind != Kind::Delete {
             ensure!(
                 index.contains_key(path),

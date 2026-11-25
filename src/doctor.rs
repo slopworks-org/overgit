@@ -7,7 +7,7 @@ use crate::{
 use anyhow::{Context as _, Result, ensure};
 use serde::Serialize;
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::{self, Write as _},
     path::PathBuf,
@@ -58,8 +58,9 @@ pub fn run(repo: &Repo, fix: bool, rebuild: bool, porcelain: bool) -> Result<i32
                 .cloned()
                 .collect();
             if let Some(manifest) = load_manifest(repo, rebuild, &mut Vec::new())? {
-                paths.extend(manifest.entries.into_keys());
+                paths.extend(repo.managed_files(&manifest)?.into_keys());
             }
+            let repo = &repo.with_layout(&paths);
             let paths: Vec<_> = paths
                 .into_iter()
                 .filter(|path| crate::model::validate_path(path).is_ok() && repo.work(path).is_ok())
@@ -164,12 +165,24 @@ fn examine(repo: &Repo, fix: bool, rebuild: bool) -> Result<Vec<Problem>> {
     if fix {
         protect_and_save_manifest(repo, &manifest, rebuild && !orphans.is_empty())?;
     }
+    let files = repo.managed_files(&manifest)?;
+    let repo = &repo.with_layout(files.keys());
     base_context(repo, &manifest, &mut problems)?;
-    detach_context(repo, &manifest, &mut problems)?;
+    detach_context(repo, &manifest, &files, &mut problems)?;
     check_config(repo, fix, &mut problems)?;
-    check_flags(repo, &manifest, fix, &mut problems)?;
-    for (path, entry) in &manifest.entries {
-        if let Err(error) = check_file(repo, path, entry, fix, &mut problems) {
+    let staged = opaque_context(repo, &manifest, &mut problems)?;
+    check_flags(repo, &files, &staged, fix, &mut problems)?;
+    let mut paths: Vec<_> = files.keys().collect();
+    paths.sort_by_key(|path| manifest.entries.contains_key(*path));
+    for path in paths {
+        let result = if let Some(entry) = manifest.entries.get(path) {
+            check_file(repo, path, entry, fix, &mut problems)
+        } else if !repo.detached() && !index.contains_key(path) && !staged.contains(path) {
+            check_opaque_file(repo, &manifest, path, fix, &mut problems)
+        } else {
+            Ok(())
+        };
+        if let Err(error) = result {
             problems.push(problem(
                 "path-unavailable",
                 Some(path),
@@ -179,7 +192,45 @@ fn examine(repo: &Repo, fix: bool, rebuild: bool) -> Result<Vec<Problem>> {
             ));
         }
     }
-    match ops::exclude_bytes(repo, Some(&manifest), !repo.detached()) {
+    check_excludes(repo, &manifest, fix, &mut problems)?;
+    Ok(problems)
+}
+
+fn opaque_context(
+    repo: &Repo,
+    manifest: &Manifest,
+    problems: &mut Vec<Problem>,
+) -> Result<BTreeSet<String>> {
+    let staged = repo.staged_opaque_files(manifest)?;
+    for path in &staged {
+        problems.push(problem(
+            "base-index-divergence",
+            Some(path),
+            false,
+            "base has staged changes inside an opaque directory",
+            "commit or unstage the base changes before repairing the directory mask",
+        ));
+    }
+    for dir in &manifest.opaque {
+        problems.push(Problem {
+            severity: Severity::Info,
+            code: "opaque-directory",
+            path: Some(dir.clone()),
+            fixable: false,
+            message: "base files in this directory are hidden while attached".into(),
+            hint: "use restore on the directory to expose its base files",
+        });
+    }
+    Ok(staged)
+}
+
+fn check_excludes(
+    repo: &Repo,
+    manifest: &Manifest,
+    fix: bool,
+    problems: &mut Vec<Problem>,
+) -> Result<()> {
+    match ops::exclude_bytes(repo, Some(manifest), !repo.detached()) {
         Ok(wanted) => {
             if fs::read(repo.common.join("info/exclude")).ok().as_deref() != Some(wanted.as_slice())
             {
@@ -203,7 +254,7 @@ fn examine(repo: &Repo, fix: bool, rebuild: bool) -> Result<Vec<Problem>> {
             "repair the exclude file or sibling worktree before changing ownership",
         )),
     }
-    Ok(problems)
+    Ok(())
 }
 
 fn context(repo: &Repo, problems: &mut Vec<Problem>) -> Result<()> {
@@ -546,12 +597,13 @@ fn check_config(repo: &Repo, fix: bool, problems: &mut Vec<Problem>) -> Result<(
 }
 fn check_flags(
     repo: &Repo,
-    manifest: &Manifest,
+    files: &BTreeMap<String, Kind>,
+    staged: &BTreeSet<String>,
     fix: bool,
     problems: &mut Vec<Problem>,
 ) -> Result<()> {
     let flags = repo.base(["ls-files", "-v", "-z"])?;
-    let mut hidden = BTreeSet::new();
+    let mut need_skip = Vec::new();
     for row in flags.split(|byte| *byte == 0).filter(|row| !row.is_empty()) {
         let Some(path) = row
             .get(2..)
@@ -559,15 +611,14 @@ fn check_flags(
         else {
             continue;
         };
-        let owned = manifest.entries.contains_key(path);
+        let owned = files.contains_key(path);
         if row[0].is_ascii_lowercase() {
             problems.push(problem("assume-unchanged", Some(path), owned, "base has an assume-unchanged flag", "owned flags can be repaired with doctor --fix; unowned flags are left under your control"));
-            if fix && owned {
+            if fix && owned && !staged.contains(path) && repo.work(path).is_ok() {
                 repo.base(["update-index", "--no-assume-unchanged", "--", path])?;
             }
         }
         if row[0].eq_ignore_ascii_case(&b'S') {
-            hidden.insert(path.to_owned());
             if !owned {
                 problems.push(problem(
                     "unowned-skip",
@@ -577,25 +628,42 @@ fn check_flags(
                     "clear it explicitly if unwanted; doctor does not adopt it",
                 ));
             }
-        }
-    }
-    if !repo.detached() {
-        let mut need_skip = Vec::new();
-        for path in manifest.entries.keys() {
-            if repo.index_file(path, false)?.is_some() && !hidden.contains(path) {
-                problems.push(problem(
-                    "owned-skip-missing",
-                    Some(path),
-                    true,
-                    "owned path is not hidden from the base",
-                    "run doctor --fix",
-                ));
-                if fix {
-                    need_skip.push(path.as_str());
-                }
+        } else if owned && !repo.detached() && !staged.contains(path) {
+            problems.push(problem(
+                "owned-skip-missing",
+                Some(path),
+                true,
+                "owned path is not hidden from the base",
+                "run doctor --fix",
+            ));
+            if fix && repo.work(path).is_ok() {
+                need_skip.push(path);
             }
         }
-        repo.skip_many(need_skip, true)?;
+    }
+    repo.skip_many(need_skip, true)?;
+    Ok(())
+}
+fn check_opaque_file(
+    repo: &Repo,
+    manifest: &Manifest,
+    path: &str,
+    fix: bool,
+    problems: &mut Vec<Problem>,
+) -> Result<()> {
+    if let Some(work) = repo.work(path)? {
+        problems.push(problem(
+            "opaque-file-visible",
+            Some(path),
+            true,
+            "base file is visible inside an opaque directory",
+            "run sync or doctor --fix to hide it and back up any local edits",
+        ));
+        if fix {
+            let backup = Some(work) != repo.indexed(path, false)?;
+            repo.replace(path, None, backup, false)?;
+            ops::prune_opaque_parents(repo, manifest, path)?;
+        }
     }
     Ok(())
 }
@@ -606,7 +674,7 @@ fn check_file(
     fix: bool,
     problems: &mut Vec<Problem>,
 ) -> Result<()> {
-    repo.safe_path(path)?;
+    repo.validate_leaf(path)?;
     let base = repo.indexed(path, false)?;
     let upstream = crate::sync::upstream(repo, path)?;
     if base != upstream {
@@ -637,7 +705,9 @@ fn check_file(
             "run sync and choose an explicit ownership decision",
         ));
     }
-    if let Some(actual) = different_case(repo, path)? {
+    if !repo.masked_leaf(path)?
+        && let Some(actual) = different_case(repo, path)?
+    {
         problems.push(problem(
             "path-case-mismatch",
             Some(path),
@@ -804,7 +874,7 @@ fn base_context(repo: &Repo, manifest: &Manifest, problems: &mut Vec<Problem>) -
     let changes = repo.base(["diff", "--name-only", "-z", &format!("HEAD..{upstream}")])?;
     for path in changes.split(|byte| *byte == 0) {
         if let Ok(path) = std::str::from_utf8(path)
-            && manifest.entries.contains_key(path)
+            && manifest.manages_tracked(path)
         {
             problems.push(problem(
                 "base-pull-owned",
@@ -817,13 +887,18 @@ fn base_context(repo: &Repo, manifest: &Manifest, problems: &mut Vec<Problem>) -
     }
     Ok(())
 }
-fn detach_context(repo: &Repo, manifest: &Manifest, problems: &mut Vec<Problem>) -> Result<()> {
-    if !repo.detached() || manifest.entries.is_empty() {
+fn detach_context(
+    repo: &Repo,
+    manifest: &Manifest,
+    files: &BTreeMap<String, Kind>,
+    problems: &mut Vec<Problem>,
+) -> Result<()> {
+    if !repo.detached() || files.is_empty() {
         return Ok(());
     }
     let mut mounted = true;
-    for (path, entry) in &manifest.entries {
-        let expected = if entry.kind == Kind::Delete {
+    for (path, kind) in files {
+        let expected = if *kind == Kind::Delete {
             None
         } else {
             repo.indexed(path, true)?

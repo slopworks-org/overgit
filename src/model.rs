@@ -26,7 +26,7 @@ mod bytes {
     }
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
     Add,
@@ -55,16 +55,30 @@ pub struct Entry {
 pub struct Manifest {
     pub version: u32,
     pub entries: BTreeMap<String, Entry>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub opaque: BTreeSet<String>,
 }
 impl Default for Manifest {
     fn default() -> Self {
         Self {
             version: 2,
             entries: BTreeMap::new(),
+            opaque: BTreeSet::new(),
         }
     }
 }
 impl Manifest {
+    pub fn opaque_directory(&self, path: &str) -> Option<&str> {
+        self.opaque.get(path).map(String::as_str).or_else(|| {
+            parents(path).find_map(|parent| self.opaque.get(parent).map(String::as_str))
+        })
+    }
+
+    /// Called for tracked paths. Untracked files only belong to the overlay after add.
+    pub fn manages_tracked(&self, path: &str) -> bool {
+        self.entries.contains_key(path) || self.opaque_directory(path).is_some()
+    }
+
     pub fn validate(&self) -> Result<()> {
         ensure!(
             self.version == 2,
@@ -86,20 +100,42 @@ impl Manifest {
                 base.validate()?;
             }
         }
-        for path in self.entries.keys() {
-            let mut ancestor = std::path::Path::new(path).parent();
-            while let Some(parent) = ancestor {
-                if let Some(parent) = parent.to_str() {
+        let mut directories = BTreeMap::new();
+        for dir in &self.opaque {
+            validate_path(dir)?;
+            let identity = path_identity(dir);
+            ensure!(
+                !folded.contains(&identity) && directories.insert(identity, dir).is_none(),
+                "colliding opaque directory {dir:?}"
+            );
+        }
+        for path in self.entries.keys().chain(&self.opaque) {
+            for parent in parents(path) {
+                let identity = path_identity(parent);
+                ensure!(
+                    !folded.contains(&identity),
+                    "overlapping manifest paths {path:?} and {parent:?}"
+                );
+                if let Some(dir) = directories.get(&identity) {
                     ensure!(
-                        !folded.contains(&path_identity(parent)),
-                        "overlapping manifest paths {path:?} and {parent:?}"
+                        *dir == parent,
+                        "ambiguous opaque directory spelling at {path:?}; use {dir:?}"
+                    );
+                    ensure!(
+                        self.entries
+                            .get(path)
+                            .is_some_and(|e| e.kind != Kind::Delete),
+                        "redundant whiteout or opaque directory {path:?} inside {dir:?}"
                     );
                 }
-                ancestor = parent.parent();
             }
         }
         Ok(())
     }
+}
+
+pub fn parents(path: &str) -> impl DoubleEndedIterator<Item = &str> {
+    path.match_indices('/').map(|(end, _)| &path[..end])
 }
 impl Snapshot {
     pub fn validate(&self) -> Result<()> {

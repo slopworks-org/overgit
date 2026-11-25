@@ -173,6 +173,495 @@ mod tests {
         output
     }
 
+    fn manifest(root: &Path) -> serde_json::Value {
+        serde_json::from_slice(&content(root, ".overgit/manifest.json")).unwrap()
+    }
+
+    #[test]
+    fn opaque_manifest_rejects_overlapping_or_unsafe_paths() {
+        use serde_json::json;
+        let sandbox = Sandbox::new(&[("safe", b"untouched")]);
+        sandbox.init();
+        let add = json!({"kind":"add","base":null});
+        let delete = json!({"kind":"delete","base":{"mode":"100644","data":""}});
+        for (opaque, entries) in [
+            (json!([""]), json!({})),
+            (json!(["."]), json!({})),
+            (json!(["a/../b"]), json!({})),
+            (json!([".git/info"]), json!({})),
+            (json!(["a/"]), json!({})),
+            (json!(["rules", "rules/nested"]), json!({})),
+            (json!(["Rules", "rules"]), json!({})),
+            (json!(["rules"]), json!({"rules":add})),
+            (json!(["rules/a"]), json!({"RULES":add})),
+            (json!(["rules"]), json!({"Rules/a":add})),
+            (json!(["rules"]), json!({"rules/a":delete})),
+        ] {
+            let invalid = json!({"version":2,"entries":entries,"opaque":opaque});
+            write(
+                &sandbox.root,
+                ".overgit/manifest.json",
+                &serde_json::to_vec(&invalid).unwrap(),
+            );
+            sandbox.reject(&["apply"]);
+            assert_eq!(content(&sandbox.root, "safe"), b"untouched");
+            assert_eq!(
+                git_ok(&sandbox.root, &["ls-files", "-v", "safe"]),
+                b"H safe\n"
+            );
+        }
+    }
+
+    #[test]
+    fn opaque_directory_squashes_whiteouts_and_mounts_only_the_replacement() {
+        let sandbox = Sandbox::new(&[
+            (".agents/team/default", b"team"),
+            (".agents/old", b"obsolete"),
+            (".agents/config", b"base"),
+            (".agents-other/keep", b"sibling"),
+        ]);
+        sandbox.init();
+        let root = &sandbox.root;
+        sandbox.run(&["rm", ".agents/old", ".agents/team"]);
+        assert_eq!(manifest(root)["entries"][".agents/old"]["kind"], "delete");
+        sandbox.run(&["rm", ".agents", ".agents/team"]);
+        assert_eq!(manifest(root)["opaque"], serde_json::json!([".agents"]));
+        assert_eq!(manifest(root)["entries"], serde_json::json!({}));
+        assert!(!root.join(".agents").exists());
+        assert_eq!(content(root, ".agents-other/keep"), b"sibling");
+        assert_eq!(
+            sandbox
+                .run(&["list", "--kind", "opaque", "--porcelain"])
+                .stdout,
+            b"opaque\t.agents\0"
+        );
+
+        write(root, ".agents/config", b"my config");
+        write(root, ".agents/new/tool", b"my tool");
+        sandbox.run(&["add", ".agents"]);
+        sandbox.clean_base();
+        assert_eq!(
+            manifest(root)["entries"][".agents/config"]["kind"],
+            "override"
+        );
+        assert_eq!(manifest(root)["entries"][".agents/new/tool"]["kind"], "add");
+        let inspect = sandbox.run(&[
+            "inspect",
+            "--porcelain",
+            ".agents",
+            ".agents/old",
+            ".agents/config",
+        ]);
+        assert_eq!(inspect.stdout, b"overlay\topaque\t.agents\0overlay\topaque\t.agents/old\0overlay\toverride\t.agents/config\0");
+        let status: serde_json::Value =
+            serde_json::from_slice(&sandbox.run(&["status", "--porcelain"]).stdout).unwrap();
+        assert_eq!(status["opaque"], serde_json::json!([".agents"]));
+        sandbox.run(&["commit", "-m", "replace agents"]);
+
+        sandbox.upstream(&[
+            (".agents/old", None),
+            (".agents/team/default", Some(b"changed")),
+            (".agents/team/new", Some(b"upstream")),
+        ]);
+        assert!(!root.join(".agents/team").exists());
+        assert_eq!(content(root, ".agents/config"), b"my config");
+        assert_eq!(content(root, ".agents/new/tool"), b"my tool");
+        sandbox.run(&["sync"]);
+        sandbox.clean_base();
+
+        sandbox.run(&["rm", ".agents/config"]);
+        assert!(manifest(root)["entries"].get(".agents/config").is_none());
+        assert!(!root.join(".agents/config").exists());
+        assert_eq!(
+            git_ok(root, &["ls-files", "-v", "--", ".agents/config"]),
+            b"S .agents/config\n"
+        );
+        sandbox.run(&["detach"]);
+        assert_eq!(content(root, ".agents/team/default"), b"changed");
+        assert_eq!(content(root, ".agents/team/new"), b"upstream");
+        assert!(!root.join(".agents/new").exists());
+        sandbox.run(&["attach"]);
+        sandbox.run(&["restore", ".agents"]);
+        assert!(manifest(root).get("opaque").is_none());
+        assert_eq!(content(root, ".agents/config"), b"base");
+        assert_eq!(content(root, ".agents/team/new"), b"upstream");
+        assert!(!root.join(".agents/new").exists());
+        sandbox.clean_base();
+    }
+
+    #[test]
+    fn opaque_replacements_can_switch_files_symlinks_and_directories() {
+        let sandbox = Sandbox::new(&[
+            ("rules/tool", b"base file"),
+            ("rules/skills/nested/item", b"base skill"),
+        ]);
+        sandbox.init();
+        let root = &sandbox.root;
+        sandbox.run(&["rm", "rules"]);
+        let external = sandbox.temporary.path().join("external");
+        write(&external, "nested/item", b"external skill");
+        write(root, "rules/tool/new/script", b"personal script");
+        symlink(&external, root.join("rules/skills")).unwrap();
+        sandbox.run(&["add", "rules"]);
+        sandbox.run(&["commit", "-m", "replace rules with a different layout"]);
+        sandbox.clean_base();
+        let reader = sandbox.temporary.path().join("reader");
+        cli_code(
+            sandbox.temporary.path(),
+            &[
+                "clone",
+                root.join(".overgit/.git").to_str().unwrap(),
+                reader.to_str().unwrap(),
+                "--base",
+                root.to_str().unwrap(),
+            ],
+            0,
+        );
+        assert_eq!(
+            content(&reader, "rules/tool/new/script"),
+            b"personal script"
+        );
+        assert_eq!(
+            fs::read_link(reader.join("rules/skills")).unwrap(),
+            external
+        );
+        sandbox.run(&["sync"]);
+        sandbox.run(&["doctor"]);
+        sandbox.run(&["status", "--all"]);
+        sandbox.run(&["detach"]);
+        assert_eq!(content(root, "rules/tool"), b"base file");
+        assert_eq!(content(root, "rules/skills/nested/item"), b"base skill");
+        sandbox.run(&["attach"]);
+        assert_eq!(fs::read_link(root.join("rules/skills")).unwrap(), external);
+        assert_eq!(content(root, "rules/tool/new/script"), b"personal script");
+        sandbox.clean_base();
+
+        write(root, "rules/tool/untracked", b"untracked");
+        sandbox.reject(&["restore", "rules"]);
+        assert_eq!(content(root, "rules/tool/untracked"), b"untracked");
+        assert_eq!(content(root, "rules/tool/new/script"), b"personal script");
+        assert_eq!(manifest(root)["opaque"], serde_json::json!(["rules"]));
+        fs::remove_file(root.join("rules/tool/untracked")).unwrap();
+
+        sandbox.run(&["restore", "rules"]);
+        assert_eq!(content(root, "rules/tool"), b"base file");
+        assert_eq!(content(root, "rules/skills/nested/item"), b"base skill");
+        assert_eq!(content(&external, "nested/item"), b"external skill");
+        sandbox.run(&["commit", "-m", "release the directory"]);
+        cli_code(&reader, &["pull", "--ff-only"], 0);
+        assert_eq!(content(&reader, "rules/tool"), b"base file");
+        assert_eq!(content(&reader, "rules/skills/nested/item"), b"base skill");
+        assert!(git_ok(&reader, &["status", "--porcelain", "-uall"]).is_empty());
+        sandbox.clean_base();
+    }
+
+    #[test]
+    fn opaque_attach_force_preserves_detached_state_when_obstructed() {
+        let sandbox = Sandbox::new(&[("rules/a", b"base a"), ("rules/tool/base", b"base tool")]);
+        let root = &sandbox.root;
+        sandbox.init();
+        sandbox.run(&["rm", "rules"]);
+        write(root, "rules/tool", b"overlay tool");
+        sandbox.run(&["add", "rules/tool"]);
+        sandbox.run(&["commit", "-m", "replace rules"]);
+        sandbox.run(&["detach"]);
+        fs::remove_file(root.join("rules/a")).unwrap();
+        write(root, "rules/a/keep", b"obstructing directory");
+        write(root, "rules/tool/local", b"untracked tool data");
+        let flags = git_ok(root, &["ls-files", "-v", "-z"]);
+        let marker = content(root, ".overgit/local/detached.json");
+        let exclude = content(root, ".git/info/exclude");
+        let check_failed_attach = || {
+            sandbox.reject(&["attach", "--force"]);
+            assert_eq!(git_ok(root, &["ls-files", "-v", "-z"]), flags);
+            assert_eq!(content(root, "rules/tool/base"), b"base tool");
+            assert_eq!(content(root, "rules/tool/local"), b"untracked tool data");
+            assert_eq!(content(root, ".overgit/local/detached.json"), marker);
+            assert_eq!(content(root, ".git/info/exclude"), exclude);
+            assert!(!root.join(".overgit/local/mutation.json").exists());
+        };
+        check_failed_attach();
+        assert_eq!(content(root, "rules/a/keep"), b"obstructing directory");
+
+        let saved = sandbox.temporary.path();
+        fs::rename(root.join("rules/a"), saved.join("saved-a")).unwrap();
+        check_failed_attach();
+
+        fs::rename(root.join("rules/tool/local"), saved.join("saved-local")).unwrap();
+        sandbox.run(&["attach"]);
+        assert_eq!(content(root, "rules/tool"), b"overlay tool");
+        sandbox.clean_base();
+    }
+
+    #[test]
+    fn opaque_sync_hides_new_files_from_a_real_base_pull_while_attached() {
+        let sandbox = Sandbox::new(&[("rules/old", b"base")]);
+        let root = &sandbox.root;
+        let writer = sandbox.temporary.path().join("upstream");
+        git_ok(root, &["clone", ".", writer.to_str().unwrap()]);
+        sandbox.init();
+        sandbox.run(&["rm", "rules"]);
+        write(root, "rules/custom", b"my rules");
+        sandbox.run(&["add", "rules/custom"]);
+        write(&writer, "rules/nested/new", b"new upstream rules");
+        git_ok(&writer, &["add", "."]);
+        git_ok(&writer, &["commit", "-m", "add upstream rules"]);
+        git_ok(
+            root,
+            &["pull", "--ff-only", writer.to_str().unwrap(), "main"],
+        );
+        assert_eq!(content(root, "rules/nested/new"), b"new upstream rules");
+        cli_code(root, &["sync", "--dry-run"], 4);
+        sandbox.run(&["sync", "--only", "rules"]);
+        assert!(!root.join("rules/nested").exists());
+        assert_eq!(content(root, "rules/custom"), b"my rules");
+        assert_eq!(
+            git_ok(root, &["ls-files", "-v", "--", "rules/nested/new"]),
+            b"S rules/nested/new\n"
+        );
+        assert!(manifest(root)["entries"].get("rules/nested/new").is_none());
+        sandbox.run(&["sync", "--dry-run"]);
+        sandbox.clean_base();
+        sandbox.run(&["restore", "--all"]);
+        assert_eq!(content(root, "rules/nested/new"), b"new upstream rules");
+        assert!(!root.join("rules/custom").exists());
+        sandbox.clean_base();
+    }
+
+    #[test]
+    fn opaque_sync_and_doctor_preserve_an_uncommitted_base_addition() {
+        let sandbox = Sandbox::new(&[("rules/base", b"base")]);
+        sandbox.init();
+        sandbox.run(&["rm", "rules"]);
+        let root = &sandbox.root;
+        write(root, "rules/staged", b"staged base bytes");
+        git_ok(root, &["add", "rules/staged"]);
+        sandbox.reject(&["sync"]);
+        sandbox.reject(&["apply"]);
+        cli_code(root, &["doctor", "--fix"], 4);
+        assert_eq!(content(root, "rules/staged"), b"staged base bytes");
+        assert_eq!(
+            git_ok(root, &["show", ":rules/staged"]),
+            b"staged base bytes"
+        );
+        assert_eq!(
+            git_ok(root, &["ls-files", "-v", "rules/staged"]),
+            b"H rules/staged\n"
+        );
+        git_ok(root, &["commit", "-m", "record base addition"]);
+        sandbox.run(&["sync"]);
+        assert!(!root.join("rules/staged").exists());
+        sandbox.clean_base();
+    }
+
+    #[test]
+    fn opaque_parent_squashes_an_overlay_only_directory_after_its_last_file_is_gone() {
+        let sandbox = Sandbox::new(&[]);
+        sandbox.init();
+        write(&sandbox.root, "config/nested/local", b"local");
+        sandbox.run(&["add", "config/nested"]);
+        sandbox.run(&["rm", "config/nested"]);
+        assert!(sandbox.root.join("config").is_dir());
+        sandbox.run(&["rm", "config"]);
+        assert!(!sandbox.root.join("config").exists());
+        assert_eq!(
+            manifest(&sandbox.root)["opaque"],
+            serde_json::json!(["config"])
+        );
+        sandbox.run(&["restore", "config"]);
+        assert!(manifest(&sandbox.root).get("opaque").is_none());
+    }
+
+    #[test]
+    fn aborting_sync_restores_an_implicitly_hidden_file_and_its_original_base_flags() {
+        let sandbox = Sandbox::new(&[("rules/file", b"original\n")]);
+        sandbox.init();
+        sandbox.run(&["rm", "rules"]);
+        write(&sandbox.root, "rules/file", b"personal\n");
+        sandbox.run(&["add", "rules/file"]);
+        sandbox.upstream(&[
+            ("rules/new", Some(b"introduced")),
+            ("rules/file", Some(b"upstream\n")),
+        ]);
+        git_ok(
+            &sandbox.root,
+            &["update-index", "--no-skip-worktree", "rules/new"],
+        );
+        git_ok(&sandbox.root, &["checkout", "--", "rules/new"]);
+        let flags = git_ok(&sandbox.root, &["ls-files", "-v", "-z"]);
+        cli_code(&sandbox.root, &["sync"], 3);
+        assert!(!sandbox.root.join("rules/new").exists());
+        cli_code(&sandbox.root, &["sync", "--dry-run", "--only", "rules"], 4);
+        sandbox.run(&["sync", "--abort"]);
+        assert_eq!(content(&sandbox.root, "rules/new"), b"introduced");
+        assert_eq!(content(&sandbox.root, "rules/file"), b"personal\n");
+        assert_eq!(git_ok(&sandbox.root, &["ls-files", "-v", "-z"]), flags);
+    }
+
+    #[test]
+    fn opaque_directory_stays_hidden_when_upstream_replaces_it_with_a_file() {
+        let sandbox = Sandbox::new(&[("rules/base", b"base")]);
+        sandbox.init();
+        sandbox.run(&["rm", "rules"]);
+        sandbox.run(&["detach"]);
+        fs::remove_file(sandbox.root.join("rules/base")).unwrap();
+        fs::remove_dir(sandbox.root.join("rules")).unwrap();
+        write(&sandbox.root, "rules", b"new upstream file");
+        git_ok(&sandbox.root, &["add", "--all"]);
+        git_ok(&sandbox.root, &["commit", "-m", "replace base directory"]);
+        sandbox.run(&["attach"]);
+        sandbox.run(&["sync"]);
+        assert!(!sandbox.root.join("rules").exists());
+        sandbox.clean_base();
+        sandbox.run(&["restore", "rules"]);
+        assert_eq!(content(&sandbox.root, "rules"), b"new upstream file");
+        sandbox.clean_base();
+    }
+
+    #[test]
+    fn opaque_attach_and_restore_preserve_a_new_base_file_above_empty_masks() {
+        let sandbox = Sandbox::new(&[
+            ("assets/icons/icon", b"icon"),
+            ("assets/fonts/font", b"font"),
+        ]);
+        let root = &sandbox.root;
+        sandbox.init();
+        sandbox.run(&["rm", "assets/icons", "assets/fonts"]);
+        sandbox.run(&["detach"]);
+        git_ok(root, &["rm", "-r", "assets"]);
+        write(root, "assets", b"upstream file");
+        git_ok(root, &["add", "assets"]);
+        git_ok(root, &["commit", "-m", "replace assets with a file"]);
+
+        sandbox.run(&["attach"]);
+        assert_eq!(content(root, "assets"), b"upstream file");
+        assert_eq!(git_ok(root, &["ls-files", "-v", "assets"]), b"H assets\n");
+        assert_eq!(
+            manifest(root)["opaque"],
+            serde_json::json!(["assets/fonts", "assets/icons"])
+        );
+
+        sandbox.run(&["restore", "assets/icons"]);
+        assert_eq!(
+            manifest(root)["opaque"],
+            serde_json::json!(["assets/fonts"])
+        );
+        sandbox.run(&["restore", "--all"]);
+        assert!(manifest(root).get("opaque").is_none());
+        assert_eq!(content(root, "assets"), b"upstream file");
+        assert_eq!(git_ok(root, &["ls-files", "-v", "assets"]), b"H assets\n");
+        sandbox.clean_base();
+    }
+
+    #[test]
+    fn opaque_directory_repair_recovers_the_rule_and_rescues_unexpected_work() {
+        let sandbox = Sandbox::new(&[("rules/base", b"original")]);
+        sandbox.init();
+        let root = &sandbox.root;
+        write(root, "rules/local", b"untracked");
+        write(root, "rules/base", b"unstaged");
+        sandbox.reject(&["rm", "rules"]);
+        assert!(manifest(root).get("opaque").is_none());
+        git_ok(root, &["add", "rules/base"]);
+        sandbox.reject(&["rm", "--force", "rules"]);
+        git_ok(root, &["reset", "--", "rules/base"]);
+        sandbox.run(&["rm", "--force", "rules"]);
+        assert_eq!(content(root, "rules/local"), b"untracked");
+        assert_eq!(
+            sandbox.reject(&["which", "rules/local"]).status.code(),
+            Some(1)
+        );
+        sandbox.run(&["commit", "-m", "mask rules"]);
+        write(root, "rules/base", b"unexpected");
+        git_ok(root, &["update-index", "--no-skip-worktree", "rules/base"]);
+        let problems: Vec<serde_json::Value> =
+            serde_json::from_slice(&cli_code(root, &["doctor", "--porcelain"], 4).stdout).unwrap();
+        for code in [
+            "opaque-directory",
+            "opaque-file-visible",
+            "owned-skip-missing",
+        ] {
+            assert!(
+                problems.iter().any(|problem| problem["code"] == code),
+                "{problems:?}"
+            );
+        }
+        write(root, ".overgit/manifest.json", b"invalid");
+        sandbox.run(&["doctor", "--fix", "--rebuild"]);
+        assert_eq!(manifest(root)["opaque"], serde_json::json!(["rules"]));
+        assert!(!root.join("rules/base").exists());
+        assert_eq!(content(root, "rules/local"), b"untracked");
+        let backups = backup_contents(&root.join(".overgit/local/backups"));
+        for expected in [b"unstaged".as_slice(), b"unexpected"] {
+            assert!(backups.iter().any(|bytes| bytes == expected));
+        }
+        sandbox.run(&["doctor"]);
+        assert_eq!(
+            git_ok(root, &["status", "--porcelain", "-uall"]),
+            b"?? rules/local\n"
+        );
+    }
+
+    #[test]
+    fn dropping_an_explicit_opaque_replacement_keeps_the_new_base_file_hidden() {
+        let sandbox = Sandbox::new(&[("rules/base", b"base")]);
+        sandbox.init();
+        let root = &sandbox.root;
+        sandbox.run(&["rm", "rules"]);
+        write(root, "rules/added", b"my rules");
+        sandbox.run(&["add", "rules/added"]);
+        sandbox.upstream(&[("rules/added", Some(b"upstream collision"))]);
+        cli_code(root, &["sync"], 3);
+        sandbox.run(&["resolve", "--drop", "rules/added"]);
+        assert!(!root.join("rules/added").exists());
+        assert_eq!(manifest(root)["entries"], serde_json::json!({}));
+        sandbox.clean_base();
+        sandbox.run(&["restore", "rules"]);
+        assert_eq!(content(root, "rules/added"), b"upstream collision");
+    }
+
+    #[test]
+    fn overlay_pull_installs_and_releases_opaque_directories_against_the_local_base() {
+        let sandbox = Sandbox::new(&[("dir/base", b"base")]);
+        sandbox.init();
+        let reader = sandbox.temporary.path().join("reader");
+        let overlay = sandbox.root.join(".overgit/.git");
+        cli_code(
+            sandbox.temporary.path(),
+            &[
+                "clone",
+                overlay.to_str().unwrap(),
+                reader.to_str().unwrap(),
+                "--base",
+                sandbox.root.to_str().unwrap(),
+            ],
+            0,
+        );
+        write(&reader, "dir/client-only", b"local base");
+        git_ok(&reader, &["add", "dir/client-only"]);
+        git_ok(&reader, &["commit", "-m", "extra local base file"]);
+        sandbox.run(&["rm", "dir"]);
+        write(&sandbox.root, "dir/mine", b"portable addition");
+        sandbox.run(&["add", "dir/mine"]);
+        sandbox.run(&["commit", "-m", "mask dir"]);
+        cli_code(&reader, &["pull", "--ff-only"], 0);
+        assert!(!reader.join("dir/base").exists());
+        assert!(!reader.join("dir/client-only").exists());
+        assert_eq!(content(&reader, "dir/mine"), b"portable addition");
+        assert!(git_ok(&reader, &["status", "--porcelain", "-uall"]).is_empty());
+        sandbox.run(&["restore", "dir"]);
+        sandbox.run(&["commit", "-m", "release dir"]);
+        cli_code(&reader, &["pull", "--ff-only"], 0);
+        assert_eq!(content(&reader, "dir/client-only"), b"local base");
+        assert_eq!(content(&reader, "dir/base"), b"base");
+        assert!(!reader.join("dir/mine").exists());
+        assert_eq!(
+            git_ok(&reader, &["ls-files", "-v", "--", "dir/client-only"]),
+            b"H dir/client-only\n"
+        );
+        assert!(git_ok(&reader, &["status", "--porcelain", "-uall"]).is_empty());
+    }
+
     #[test]
     fn ownership_lifecycle_keeps_base_clean_and_captures_only_overlay_content() {
         let sandbox = Sandbox::new(&[
@@ -1034,6 +1523,25 @@ mod tests {
                 &["status", "--porcelain=v1", "--untracked-files=all"]
             ))
             .contains("keep")
+        );
+    }
+
+    #[test]
+    fn restore_keep_file_preserves_an_add_that_upstream_now_tracks() {
+        let sandbox = Sandbox::new(&[]);
+        let root = &sandbox.root;
+        sandbox.init();
+        write(root, "config", b"personal\n");
+        sandbox.run(&["add", "config"]);
+        sandbox.upstream(&[("config", Some(b"new base\n"))]);
+        assert_eq!(content(root, "config"), b"personal\n");
+
+        sandbox.run(&["restore", "--keep-file", "config"]);
+        assert_eq!(content(root, "config"), b"personal\n");
+        assert!(sandbox.run(&["list", "--porcelain"]).stdout.is_empty());
+        assert_eq!(
+            git_ok(root, &["status", "--porcelain=v1", "--", "config"]),
+            b" M config\n"
         );
     }
 

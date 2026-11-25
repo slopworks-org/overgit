@@ -20,7 +20,7 @@ jobs:
           version: 2026.9.15
       - run: mise run check
       - run: mise exec -- bash .github/scripts/package-release.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: package-${{ matrix.os }}
           path: target/dist/*.tar.gz

@@ -1,6 +1,6 @@
 use crate::{
     git,
-    model::{MANIFEST, Manifest, Snapshot, path_identity, validate_path},
+    model::{Kind, MANIFEST, Manifest, Snapshot, parents, path_identity, validate_path},
 };
 use anyhow::{Context as _, Result, bail, ensure};
 use std::{
@@ -26,6 +26,8 @@ pub struct Repo {
     pub common: PathBuf,
     gitlink_paths: RefCell<Option<BTreeSet<String>>>,
     base_spellings: RefCell<Option<BTreeMap<String, BTreeSet<String>>>>,
+    // File slots that are directories in the other layout of this operation.
+    file_directories: BTreeSet<String>,
     pub(crate) inspection: Option<std::rc::Rc<RefCell<crate::inspection::ReadCache>>>,
 }
 
@@ -68,6 +70,7 @@ impl Repo {
             common,
             gitlink_paths: RefCell::new(None),
             base_spellings: RefCell::new(None),
+            file_directories: BTreeSet::new(),
             inspection: None,
         };
         repo.metadata_safe()?;
@@ -87,6 +90,7 @@ impl Repo {
             root,
             gitlink_paths: RefCell::new(None),
             base_spellings: RefCell::new(None),
+            file_directories: BTreeSet::new(),
             inspection: None,
         };
         repo.metadata_safe()?;
@@ -442,6 +446,174 @@ impl Repo {
         }
         Ok(None)
     }
+    /// Expand directory masks against this worktree's index, including new base files.
+    /// Git paths outside the masks may contain arbitrary bytes.
+    pub fn managed_files(&self, manifest: &Manifest) -> Result<BTreeMap<String, Kind>> {
+        let mut files: BTreeMap<_, _> = manifest
+            .entries
+            .iter()
+            .map(|(path, entry)| (path.clone(), entry.kind))
+            .collect();
+        if manifest.opaque.is_empty() {
+            return Ok(files);
+        }
+        let mut directories = BTreeMap::new();
+        let mut mask_parents = BTreeMap::new();
+        for dir in &manifest.opaque {
+            directories.insert(path_identity(dir), dir);
+            mask_parents.extend(parents(dir).map(|p| (path_identity(p), None)));
+        }
+        let index = self.read_index(false, None)?;
+        for row in index.split(|byte| *byte == 0).filter(|r| !r.is_empty()) {
+            let tab = row
+                .iter()
+                .position(|b| *b == b'\t')
+                .context("invalid base index record")?;
+            let raw = &row[tab + 1..];
+            let path = String::from_utf8_lossy(raw);
+            let header = &row[..tab];
+            if let Some(ancestor) = mask_parents.get_mut(&path_identity(&path)) {
+                ensure!(header.ends_with(b" 0"), "unmerged base index at {path:?}");
+                *ancestor = Some(
+                    std::str::from_utf8(raw)
+                        .context("non-UTF-8 base path above an opaque directory")?,
+                );
+                continue;
+            }
+            for parent in parents(&path).chain([path.as_ref()]) {
+                if let Some(dir) = directories.get(&path_identity(parent)) {
+                    ensure!(
+                        *dir == parent,
+                        "ambiguous base path {path:?} under opaque directory {dir:?}"
+                    );
+                    let path = std::str::from_utf8(raw)
+                        .context("non-UTF-8 base path inside an opaque directory")?;
+                    validate_path(path)?;
+                    ensure!(header.ends_with(b" 0"), "unmerged base index at {path:?}");
+                    ensure!(
+                        !header.starts_with(b"160000 "),
+                        "submodules are unsupported at {path:?}"
+                    );
+                    files.entry(path.to_owned()).or_insert(Kind::Delete);
+                    break;
+                }
+            }
+        }
+        for dir in &manifest.opaque {
+            if let Some(parent) = parents(dir).find_map(|p| mask_parents[&path_identity(p)]) {
+                // A base file has no leaves beneath it to hide. A replacement
+                // would require writing through that file, so reject it.
+                ensure!(
+                    Path::new(dir).starts_with(parent)
+                        && !manifest
+                            .entries
+                            .keys()
+                            .any(|p| Path::new(p).starts_with(dir)),
+                    "base file {parent:?} collides with opaque directory {dir:?}"
+                );
+                self.safe_path(parent)?;
+            } else {
+                self.safe_path(dir)?;
+            }
+        }
+        // A file can replace a directory in the other tree. Both names must use
+        // the same spelling for the switch to work on case-insensitive filesystems.
+        let mut leaves = BTreeMap::new();
+        for path in files.keys() {
+            ensure!(
+                leaves.insert(path_identity(path), path).is_none(),
+                "case or Unicode collision at {path:?} in opaque layout"
+            );
+        }
+        for path in files.keys() {
+            for parent in parents(path) {
+                if let Some(leaf) = leaves.get(&path_identity(parent)) {
+                    ensure!(
+                        *leaf == parent,
+                        "ambiguous directory spelling at {path:?}; use {leaf:?}"
+                    );
+                }
+            }
+        }
+        Ok(files)
+    }
+
+    pub fn with_layout<'a>(
+        &self,
+        paths: impl IntoIterator<Item = &'a String>,
+    ) -> std::borrow::Cow<'_, Self> {
+        let paths: BTreeSet<_> = paths.into_iter().map(String::as_str).collect();
+        let mut repo = std::borrow::Cow::Borrowed(self);
+        for path in &paths {
+            for parent in parents(path).filter(|p| paths.contains(p)) {
+                if !repo.file_directories.contains(parent) {
+                    repo.to_mut().file_directories.insert(parent.to_owned());
+                }
+            }
+        }
+        repo
+    }
+
+    pub fn file_or_directory(&self, path: &str) -> bool {
+        self.file_directories.contains(path)
+    }
+
+    // An owned file or symlink can mask an entire base subtree. A lookup below
+    // it has no working leaf. Never try to read through that parent.
+    pub fn masked_leaf(&self, path: &str) -> Result<bool> {
+        if self.file_directories.is_empty() {
+            return Ok(false);
+        }
+        validate_path(path)?;
+        for parent in parents(path).filter(|p| self.file_or_directory(p)) {
+            if let Ok(meta) = fs::symlink_metadata(self.safe_path(parent)?)
+                && (meta.is_file() || meta.is_symlink())
+            {
+                return Ok(true);
+            }
+        }
+        if self.file_or_directory(path) {
+            let absolute = self.safe_path(path)?;
+            if fs::symlink_metadata(&absolute).is_ok_and(|m| m.is_dir()) {
+                ensure!(
+                    !absolute.join(".git").exists(),
+                    "nested repository at {path:?}"
+                );
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+    pub fn validate_leaf(&self, path: &str) -> Result<()> {
+        if !self.masked_leaf(path)? {
+            self.safe_path(path)?;
+        }
+        Ok(())
+    }
+    pub fn prune_parents(&self, path: &str, root: &str) -> Result<()> {
+        if self.masked_leaf(path)? {
+            return Ok(());
+        }
+        for dir in parents(path)
+            .rev()
+            .take_while(|dir| dir.len() >= root.len())
+        {
+            match fs::remove_dir(self.safe_path(dir)?) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::DirectoryNotEmpty | std::io::ErrorKind::NotADirectory
+                    ) =>
+                {
+                    break;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
     pub fn indexed(&self, path: &str, overlay: bool) -> Result<Option<Snapshot>> {
         let Some((mode, oid)) = self.index_file(path, overlay)? else {
             return Ok(None);
@@ -473,7 +645,11 @@ impl Repo {
             .context("invalid Git tree record")?;
         let mut fields = std::str::from_utf8(&record[..tab])?.split_whitespace();
         let mode = fields.next().context("missing tree mode")?.to_owned();
-        ensure!(fields.next() == Some("blob"), "not a blob at {path:?}");
+        let object_type = fields.next();
+        if object_type == Some("tree") {
+            return Ok(None);
+        }
+        ensure!(object_type == Some("blob"), "not a blob at {path:?}");
         let oid = fields.next().context("missing tree oid")?;
         let snapshot = Snapshot {
             mode,
@@ -483,6 +659,9 @@ impl Repo {
         Ok(Some(snapshot))
     }
     pub fn work(&self, path: &str) -> Result<Option<Snapshot>> {
+        if self.masked_leaf(path)? {
+            return Ok(None);
+        }
         let absolute = self.safe_path(path)?;
         read_snapshot(&absolute)
     }
@@ -590,16 +769,45 @@ impl Repo {
     pub fn skip(&self, path: &str, hide: bool) -> Result<()> {
         self.skip_many([path], hide)
     }
-    pub fn staged_base_safe(&self, path: &str) -> Result<()> {
+    pub fn skipped(&self) -> Result<BTreeSet<String>> {
+        Ok(self
+            .base(["ls-files", "-v", "-z"])?
+            .split(|byte| *byte == 0)
+            .filter_map(|row| {
+                std::str::from_utf8(row.strip_prefix(b"S ")?)
+                    .ok()
+                    .map(str::to_owned)
+            })
+            .collect())
+    }
+    pub fn assert_base_unstaged(&self, path: &str) -> Result<()> {
         let bytes = self.base(["diff", "--cached", "--name-only", "-z", "--", path])?;
         ensure!(
             bytes.is_empty(),
             "base has staged changes at {path:?}; commit or unstage them first"
         );
+        Ok(())
+    }
+    pub fn staged_opaque_files(&self, manifest: &Manifest) -> Result<BTreeSet<String>> {
+        if manifest.opaque.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        Ok(self
+            .base(["diff", "--cached", "--no-renames", "--name-only", "-z"])?
+            .split(|byte| *byte == 0)
+            .filter_map(|p| std::str::from_utf8(p).ok())
+            .filter(|p| {
+                !manifest.entries.contains_key(*p) && manifest.opaque_directory(p).is_some()
+            })
+            .map(str::to_owned)
+            .collect())
+    }
+    pub fn staged_base_safe(&self, path: &str) -> Result<()> {
+        self.assert_base_unstaged(path)?;
         let flags = self.base(["ls-files", "-v", "-z", "--", path])?;
         let owned = self
             .manifest()
-            .is_ok_and(|manifest| manifest.entries.contains_key(path));
+            .is_ok_and(|manifest| manifest.manages_tracked(path));
         if let Some(flag) = flags.first() {
             ensure!(
                 owned || (*flag != b'S' && !flag.is_ascii_lowercase()),
@@ -615,9 +823,16 @@ impl Repo {
         backup: bool,
         force: bool,
     ) -> Result<()> {
+        if value.is_none() && self.masked_leaf(path)? {
+            return Ok(());
+        }
         let absolute = self.safe_path(path)?;
         if let Ok(meta) = fs::symlink_metadata(&absolute) {
-            if meta.is_dir() || (!meta.is_file() && !meta.file_type().is_symlink()) {
+            if meta.is_dir() && self.file_or_directory(path) {
+                fs::remove_dir(&absolute).with_context(|| {
+                    format!("cannot replace directory {path:?}; move any remaining files first")
+                })?;
+            } else if meta.is_dir() || (!meta.is_file() && !meta.file_type().is_symlink()) {
                 ensure!(
                     force,
                     "non-file obstruction at {path:?}; use --force to rescue and replace it"
@@ -645,7 +860,11 @@ impl Repo {
         match value {
             Some(value) => write_snapshot(&absolute, value)?,
             None => match fs::remove_file(&absolute) {
-                Ok(()) => {}
+                Ok(()) => {
+                    if let Some(root) = parents(path).find(|p| self.file_or_directory(p)) {
+                        self.prune_parents(path, root)?;
+                    }
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
             },
@@ -717,6 +936,19 @@ fn recovery_metadata(
     )
 }
 
+pub fn leaf_metadata(root: &Path, path: &str) -> Result<Option<fs::Metadata>> {
+    // A leaf below a regular file or symlink has no entry in this worktree.
+    for component in parents(path).chain([path]) {
+        match fs::symlink_metadata(root.join(component)) {
+            Ok(meta) if component == path => return Ok(Some(meta)),
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => return Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(None)
+}
 pub fn ensure_not_symlink(path: &Path) -> Result<()> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()

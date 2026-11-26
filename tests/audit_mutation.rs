@@ -195,6 +195,50 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_opaque_rm_restores_files_flags_and_previous_whiteouts() {
+        let sandbox = Sandbox::new();
+        let root = &sandbox.root;
+        fs::create_dir_all(root.join("dir/nested")).unwrap();
+        fs::write(root.join("dir/nested/base"), b"base child").unwrap();
+        fs::create_dir(root.join("dir/empty")).unwrap();
+        fs::write(root.join("dir/empty/whiteout"), b"previous whiteout").unwrap();
+        sandbox.git(&["add", "dir"]);
+        sandbox.git(&["commit", "-m", "base directory"]);
+        sandbox.cli(&["rm", "dir/empty/whiteout"], 0);
+        fs::write(root.join("dir/private"), b"private child").unwrap();
+        sandbox.cli(&["add", "dir/private"], 0);
+        let manifest = fs::read(root.join(".overgit/manifest.json")).unwrap();
+        let flags = sandbox.git(&["ls-files", "-v", "-z"]).stdout;
+        let overlay = sandbox.cli(&["git", "ls-files", "--stage", "-z"], 0).stdout;
+        assert_eq!(
+            sandbox.injected(&["rm", "dir"], "kill").status.signal(),
+            Some(9)
+        );
+        assert!(!root.join("dir").exists());
+        sandbox.cli(&["doctor", "--fix"], 0);
+        assert_eq!(
+            fs::read(root.join("dir/nested/base")).unwrap(),
+            b"base child"
+        );
+        assert_eq!(
+            fs::read(root.join("dir/private")).unwrap(),
+            b"private child"
+        );
+        assert!(root.join("dir/empty").is_dir());
+        assert!(!root.join("dir/empty/whiteout").exists());
+        assert_eq!(
+            fs::read(root.join(".overgit/manifest.json")).unwrap(),
+            manifest
+        );
+        assert_eq!(sandbox.git(&["ls-files", "-v", "-z"]).stdout, flags);
+        assert_eq!(
+            sandbox.cli(&["git", "ls-files", "--stage", "-z"], 0).stdout,
+            overlay
+        );
+        assert!(!root.join(".overgit/local/mutation.json").exists());
+    }
+
+    #[test]
     fn killed_mid_add_can_recover_without_losing_original_bytes() {
         let sandbox = Sandbox::new();
         let before_index = fs::read(sandbox.root.join(".overgit/.git/index")).unwrap();

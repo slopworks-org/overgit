@@ -13,17 +13,22 @@ use std::{
     path::PathBuf,
 };
 
-pub fn list(repo: &Repo, kind: Option<Kind>, porcelain: bool) -> Result<i32> {
+pub fn list(repo: &Repo, kind: Option<&str>, porcelain: bool) -> Result<i32> {
     let manifest = repo.manifest()?;
     let mut out = io::stdout().lock();
-    for (path, entry) in manifest.entries {
-        if kind.is_some_and(|kind| entry.kind != kind) {
+    let files = manifest
+        .entries
+        .iter()
+        .map(|(path, entry)| (path, entry.kind.name()));
+    let dirs = manifest.opaque.iter().map(|dir| (dir, "opaque"));
+    for (path, name) in files.chain(dirs) {
+        if kind.is_some_and(|kind| name != kind) {
             continue;
         }
         if porcelain {
-            write!(out, "{}\t{path}\0", entry.kind.name())?;
+            write!(out, "{name}\t{path}\0")?;
         } else {
-            crate::say!("{:<8} {path:?}", entry.kind.name());
+            crate::say!("{name:<8} {path:?}");
         }
     }
     Ok(0)
@@ -37,6 +42,10 @@ pub fn which(repo: &Repo, paths: &[PathBuf], porcelain: bool) -> Result<i32> {
         let path = repo.path(input)?;
         let (owner, kind) = if let Some(entry) = manifest.entries.get(&path) {
             ("overlay", entry.kind.name())
+        } else if manifest.opaque.contains(&path)
+            || (index.contains_key(&path) && manifest.opaque_directory(&path).is_some())
+        {
+            ("overlay", "opaque")
         } else {
             outside = true;
             (
@@ -104,6 +113,7 @@ fn repository_status(repo: &Repo, overlay: bool) -> Result<Value> {
     Ok(json!({"branch":branch,"head":head,"upstream":upstream,"ahead":ahead,"behind":behind}))
 }
 fn owned_status(repo: &Repo, manifest: &Manifest) -> Result<Vec<Value>> {
+    let repo = &repo.with_layout(repo.managed_files(manifest)?.keys());
     let overlay_index = repo.index(true)?;
     let staged_bytes = repo.overlay(["diff", "--cached", "--name-only", "-z"])?;
     let staged: BTreeSet<_> = staged_bytes
@@ -156,7 +166,9 @@ fn base_changes(
         } else {
             None
         };
-        if manifest.entries.contains_key(path.as_ref()) {
+        if manifest.entries.contains_key(path.as_ref())
+            || (xy != "??" && manifest.opaque_directory(&path).is_some())
+        {
             warnings.push(format!(
                 "base can see owned path {path:?} ({xy}); run doctor"
             ));
@@ -181,7 +193,7 @@ fn pull_blocked(repo: &Repo, manifest: &Manifest, base: &Value) -> Result<Vec<St
             let Ok(path) = std::str::from_utf8(path) else {
                 continue;
             };
-            if manifest.entries.contains_key(path) {
+            if manifest.manages_tracked(path) {
                 paths.push(path.to_owned());
             }
         }
@@ -231,6 +243,12 @@ fn render_status(repo: &Repo, report: &Value, short: bool, all: bool) -> Result<
             );
         }
     }
+    let opaque = report["opaque"]
+        .as_array()
+        .context("opaque directories are missing")?;
+    for dir in opaque {
+        crate::say!("opaque   {:?}", dir.as_str().unwrap_or("?"));
+    }
     for file in files {
         if !all
             && file["staged"] == false
@@ -277,7 +295,7 @@ fn render_status(repo: &Repo, report: &Value, short: bool, all: bool) -> Result<
     if !short {
         crate::say!(
             "{} owned paths; {} base worktrees",
-            files.len(),
+            files.len() + opaque.len(),
             ops::worktree_roots(repo)?.len()
         );
     }
@@ -315,7 +333,7 @@ fn render_diagnostics(report: &Value) -> Result<()> {
         .as_array()
         .context("status diagnostics are missing")?
         .iter()
-        .filter(|finding| finding["severity"] == "info")
+        .filter(|finding| finding["severity"] == "info" && finding["code"] != "opaque-directory")
     {
         crate::say!(
             "info {} {}{}\n  {}",
@@ -380,7 +398,7 @@ pub fn status(repo: &Repo, short: bool, all: bool, porcelain: bool) -> Result<i3
     } else {
         None
     };
-    let report = json!({"version":2,"base":base,"overlay":overlay,"detached":repo.detached(),"detach":detach,"pull":pull,"sync_in_progress":repo.local("sync.json").exists(),"sync_pending":pending,"files":files,"base_changes":changes,"pull_blocked":blocked,"warnings":warnings,"problems":problems});
+    let report = json!({"version":2,"base":base,"overlay":overlay,"detached":repo.detached(),"detach":detach,"pull":pull,"sync_in_progress":repo.local("sync.json").exists(),"sync_pending":pending,"files":files,"opaque":manifest.opaque,"base_changes":changes,"pull_blocked":blocked,"warnings":warnings,"problems":problems});
     if porcelain {
         let mut out = io::stdout().lock();
         serde_json::to_writer_pretty(&mut out, &report)?;

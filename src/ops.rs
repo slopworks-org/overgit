@@ -8,7 +8,7 @@ use std::{
     collections::BTreeSet,
     fs,
     os::unix::{ffi::OsStringExt as _, fs::MetadataExt as _},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 use unicode_normalization::UnicodeNormalization as _;
 
@@ -39,20 +39,14 @@ fn ignore_pattern(path: &str) -> Result<String> {
     }
     Ok(pattern)
 }
-fn assert_reserved_alias_safe(root: &std::path::Path, path: &str, alias: &str) -> Result<()> {
+fn assert_reserved_alias_safe(root: &Path, path: &str, alias: &str) -> Result<()> {
     if path == alias {
         return Ok(());
     }
-    let aliased = match fs::symlink_metadata(root.join(alias)) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
+    let Some(aliased) = crate::repo::leaf_metadata(root, alias)? else {
+        return Ok(());
     };
-    let original = match fs::symlink_metadata(root.join(path)) {
-        Ok(metadata) => Some(metadata),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error.into()),
-    };
+    let original = crate::repo::leaf_metadata(root, path)?;
     ensure!(
         original.is_some_and(
             |metadata| metadata.dev() == aliased.dev() && metadata.ino() == aliased.ino()
@@ -232,54 +226,14 @@ fn walk(
     }
     Ok(())
 }
-pub fn expand(repo: &Repo, inputs: &[PathBuf], add: bool, owned_only: bool) -> Result<Vec<String>> {
-    ensure!(!inputs.is_empty(), "at least one path is required");
-    let manifest = repo.manifest()?;
-    let index = if add || owned_only {
-        std::collections::BTreeMap::new()
-    } else {
-        repo.index(false)?
-    };
-    let mut paths = BTreeSet::new();
-    let gitlinks = repo.gitlinks()?;
-    for input in inputs {
-        let path = repo.relative_path(input)?;
-        if !path.is_empty() {
-            repo.safe_path(&path)?;
-        }
-        if add {
-            walk(repo, &path, &mut paths, &gitlinks)?;
-        } else {
-            let prefix = format!("{path}/");
-            let mut found = false;
-            for candidate in manifest
-                .entries
-                .keys()
-                .chain(index.keys().filter(|_| !owned_only))
-            {
-                if path.is_empty() || candidate == &path || candidate.starts_with(&prefix) {
-                    paths.insert(candidate.clone());
-                    found = true;
-                }
-            }
-            ensure!(
-                found,
-                "no matching {} paths at {path:?}",
-                if owned_only {
-                    "owned"
-                } else {
-                    "tracked or owned"
-                }
-            );
-        }
-    }
-    Ok(paths.into_iter().collect())
-}
-
 pub fn add(repo: &Repo, inputs: &[PathBuf], force: bool) -> Result<i32> {
     repo.assert_attached()?;
     repo.assert_no_sync()?;
-    let paths = expand(repo, inputs, true, false)?;
+    let mut paths = BTreeSet::new();
+    let gitlinks = repo.gitlinks()?;
+    for input in inputs {
+        walk(repo, &repo.relative_path(input)?, &mut paths, &gitlinks)?;
+    }
     let mut manifest = repo.manifest()?;
     let indexed = repo.index(true)?;
     let mut content = Vec::new();
@@ -316,6 +270,9 @@ pub fn add(repo: &Repo, inputs: &[PathBuf], force: bool) -> Result<i32> {
         content.push((path, value));
     }
     manifest.validate()?;
+    if !manifest.opaque.is_empty() {
+        repo.managed_files(&manifest)?;
+    }
     let protection = exclude_bytes(repo, Some(&manifest), true)?;
     let changed_paths: Vec<_> = content.iter().map(|(path, _)| path.clone()).collect();
     crate::mutation::run(repo, &changed_paths, || {
@@ -333,41 +290,109 @@ pub fn add(repo: &Repo, inputs: &[PathBuf], force: bool) -> Result<i32> {
 
     Ok(0)
 }
-fn expected(repo: &Repo, path: &str, kind: Kind) -> Result<bool> {
-    let work = repo.work(path)?;
-    if kind == Kind::Delete {
-        return Ok(work.is_none());
-    }
-    Ok(work.is_none() || work == repo.indexed(path, true)?)
-}
 #[derive(Clone, Copy)]
 pub enum Removal {
     Whiteout,
     Restore { all: bool, keep_file: bool },
 }
 
-pub fn remove(repo: &Repo, inputs: &[PathBuf], force: bool, action: Removal) -> Result<i32> {
-    let (restore, all, keep_file) = match action {
-        Removal::Whiteout => (false, false, false),
-        Removal::Restore { all, keep_file } => (true, all, keep_file),
+fn select_removals(
+    repo: &Repo,
+    manifest: &mut Manifest,
+    inputs: &[PathBuf],
+    action: Removal,
+) -> Result<BTreeSet<String>> {
+    let mut candidates: BTreeSet<_> = repo.managed_files(manifest)?.into_keys().collect();
+    if let Removal::Restore { all: true, .. } = action {
+        manifest.opaque.clear();
+        return Ok(candidates);
+    }
+    let remove = matches!(action, Removal::Whiteout);
+    if remove {
+        candidates.extend(repo.index(false)?.into_keys());
+    }
+    let original_dirs = manifest.opaque.clone();
+    let scopes: Vec<_> = inputs
+        .iter()
+        .map(|input| repo.relative_path(input))
+        .collect::<Result<_>>()?;
+    if !remove {
+        manifest
+            .opaque
+            .retain(|dir| !scopes.iter().any(|scope| Path::new(dir).starts_with(scope)));
+        candidates.retain(|path| {
+            manifest.entries.contains_key(path) || manifest.opaque_directory(path).is_none()
+        });
+    }
+    let mut paths = BTreeSet::new();
+    for path in scopes {
+        let selected = |candidate: &str| Path::new(candidate).starts_with(&path);
+        let mut directory = original_dirs.iter().any(|dir| selected(dir));
+        // managed_files already validated the masks being released, including
+        // those with no remaining leaves below a new base file.
+        if !path.is_empty() && (remove || !directory) {
+            repo.safe_path(&path)?;
+        }
+        for candidate in candidates.iter().filter(|p| selected(p)) {
+            directory |= *candidate != path;
+            paths.insert(candidate.clone());
+        }
+        if !remove
+            && !directory
+            && !candidates.contains(&path)
+            && let Some(dir) = manifest.opaque_directory(&path)
+        {
+            anyhow::bail!("restore opaque directory {dir:?} to expose base files at {path:?}");
+        }
+        ensure!(
+            directory || candidates.contains(&path),
+            "no matching {} paths at {path:?}",
+            if remove { "tracked or owned" } else { "owned" }
+        );
+        if remove && directory && !path.is_empty() {
+            repo.assert_base_unstaged(&path)?;
+            if manifest.opaque_directory(&path).is_none() {
+                manifest.opaque.retain(|dir| !selected(dir));
+                manifest.opaque.insert(path);
+            }
+        }
+    }
+    Ok(paths)
+}
+
+/// Remove only empty parents of managed leaves, stopping at the directory mask.
+pub fn prune_opaque_parents(repo: &Repo, manifest: &Manifest, path: &str) -> Result<()> {
+    let Some(root) = manifest.opaque_directory(path) else {
+        return Ok(());
     };
+    repo.prune_parents(path, root)
+}
+
+pub fn remove(repo: &Repo, inputs: &[PathBuf], force: bool, action: Removal) -> Result<i32> {
+    let restore = matches!(action, Removal::Restore { .. });
+    let keep_file = matches!(
+        action,
+        Removal::Restore {
+            keep_file: true,
+            ..
+        }
+    );
     repo.assert_attached()?;
     repo.assert_no_sync()?;
-    let mut manifest = repo.manifest()?;
-    let paths = if all {
-        manifest.entries.keys().cloned().collect()
-    } else {
-        expand(repo, inputs, false, restore)?
-    };
+    let previous = repo.manifest()?;
+    let mut manifest = previous.clone();
+    let paths = select_removals(repo, &mut manifest, inputs, action)?;
+    let repo = &repo.with_layout(repo.managed_files(&previous)?.keys().chain(&paths));
     let mut plans = Vec::new();
     for path in paths {
-        repo.safe_path(&path)?;
-        let prior = manifest.entries.get(&path).cloned();
+        repo.validate_leaf(&path)?;
+        let prior = previous.entries.get(&path);
         let base = repo.indexed(&path, false)?;
-        let clean = if let Some(entry) = &prior {
-            expected(repo, &path, entry.kind)?
+        let work = repo.work(&path)?;
+        let clean = if let Some(entry) = prior {
+            work.is_none() || (entry.kind != Kind::Delete && work == repo.indexed(&path, true)?)
         } else {
-            repo.work(&path)? == base
+            work == base || (previous.opaque_directory(&path).is_some() && work.is_none())
         };
         ensure!(
             clean || force,
@@ -376,13 +401,20 @@ pub fn remove(repo: &Repo, inputs: &[PathBuf], force: bool, action: Removal) -> 
         if !restore {
             repo.staged_base_safe(&path)?;
         }
-        let value = if restore { base.clone() } else { None };
-        let keep =
-            restore && keep_file && prior.as_ref().is_some_and(|entry| entry.kind == Kind::Add);
-        let entry = if !restore && base.is_some() {
+        let opaque = manifest.opaque_directory(&path).is_some();
+        let value = if restore && !opaque {
+            base.clone()
+        } else {
+            None
+        };
+        let keep = restore
+            && keep_file
+            && (!opaque || base.is_none())
+            && prior.is_some_and(|entry| entry.kind == Kind::Add);
+        let entry = if !restore && !opaque && base.is_some() {
             Some(Entry {
                 kind: Kind::Delete,
-                base: prior.and_then(|entry| entry.base).or(base),
+                base: prior.and_then(|entry| entry.base.clone()).or(base),
             })
         } else {
             None
@@ -392,25 +424,32 @@ pub fn remove(repo: &Repo, inputs: &[PathBuf], force: bool, action: Removal) -> 
         } else {
             manifest.entries.remove(&path);
         }
-        let work = repo.work(&path)?;
         let backup = !clean || (work.is_some() && work != value);
         plans.push((path, value, backup, keep));
     }
     manifest.validate()?;
     let protection = exclude_bytes(repo, Some(&manifest), true)?;
+    let managed = repo.managed_files(&manifest)?;
+    let indexed = repo.index(true)?;
+    plans.sort_by_key(|(_, value, ..)| value.is_some());
     let paths: Vec<_> = plans.iter().map(|(path, ..)| path.clone()).collect();
     crate::mutation::run(repo, &paths, || {
         let (hide, unhide): (Vec<_>, Vec<_>) = plans
             .iter()
             .map(|(path, ..)| path.as_str())
-            .partition(|path| manifest.entries.contains_key(*path));
+            .partition(|path| managed.contains_key(*path));
         repo.skip_many(hide, true)?;
         for (path, value, backup, keep) in &plans {
-            rescue_index_before_replacing(repo, path, None)?;
+            if indexed.contains_key(path) {
+                rescue_index_before_replacing(repo, path, None)?;
+                repo.unstage_path(path)?;
+            }
             if !keep {
                 repo.replace(path, value.as_ref(), *backup, force)?;
+                if value.is_none() {
+                    prune_opaque_parents(repo, if restore { &previous } else { &manifest }, path)?;
+                }
             }
-            repo.unstage_path(path)?;
         }
         repo.skip_many(unhide, false)?;
         repo.save_manifest(&manifest)?;
@@ -418,6 +457,18 @@ pub fn remove(repo: &Repo, inputs: &[PathBuf], force: bool, action: Removal) -> 
     })?;
     for (path, ..) in plans {
         crate::say!("{} {path:?}", if restore { "restored" } else { "removed" });
+    }
+    for dir in manifest.opaque.difference(&previous.opaque) {
+        crate::say!("marked directory {dir:?} opaque");
+    }
+    for dir in previous.opaque.difference(&manifest.opaque) {
+        if restore {
+            crate::say!("restored opaque directory {dir:?}");
+        } else {
+            // A nested mask can outlive its last base file. There may be no
+            // concrete leaves in the transaction to prune its empty parents.
+            prune_opaque_parents(repo, &manifest, dir)?;
+        }
     }
     Ok(0)
 }
@@ -439,7 +490,7 @@ pub fn validate_overlay(repo: &Repo, manifest: &Manifest) -> Result<()> {
         );
     }
     for (path, entry) in &manifest.entries {
-        repo.safe_path(path)?;
+        repo.validate_leaf(path)?;
         if entry.kind != Kind::Delete {
             ensure!(
                 repo.indexed(path, true)?.is_some(),
@@ -451,33 +502,54 @@ pub fn validate_overlay(repo: &Repo, manifest: &Manifest) -> Result<()> {
 }
 
 pub fn reconcile(repo: &Repo, dry_run: bool, force: bool) -> Result<bool> {
+    mount(repo, dry_run, force, true)
+}
+
+pub fn reconcile_pull(repo: &Repo) -> Result<bool> {
+    // The pull install journal covers both the old and the incoming layouts.
+    mount(repo, false, false, false)
+}
+
+fn mount(repo: &Repo, dry_run: bool, force: bool, journal: bool) -> Result<bool> {
     repo.assert_idle()?;
     let manifest = repo.manifest()?;
+    let managed = repo.managed_files(&manifest)?;
+    let repo = &repo.with_layout(managed.keys());
     validate_overlay(repo, &manifest)?;
-    let flags = repo.base(["ls-files", "-v", "-z"])?;
-    let hidden: BTreeSet<_> = flags
-        .split(|byte| *byte == 0)
-        .filter(|row| row.first() == Some(&b'S'))
-        .filter_map(|row| std::str::from_utf8(row.get(2..)?).ok().map(str::to_owned))
-        .collect();
+    let hidden = repo.skipped()?;
+    let staged = repo.staged_opaque_files(&manifest)?;
     let index = repo.index(false)?;
     let mut plans = Vec::new();
-    for (path, entry) in &manifest.entries {
-        let wanted = if entry.kind == Kind::Delete {
+    let needs_journal = journal && (repo.detached() || !manifest.opaque.is_empty());
+    for (path, kind) in &managed {
+        repo.validate_leaf(path)?;
+        let wanted = if *kind == Kind::Delete {
             None
         } else {
             repo.indexed(path, true)?
         };
-        let work = repo.work(path);
-        let blocked = work.is_err();
-        let work = if blocked { None } else { work? };
-        if blocked || work != wanted {
-            if blocked {
+        let (work, blocked) = match repo.work(path) {
+            Ok(work) => (work, false),
+            Err(error) if needs_journal => {
+                return Err(error).with_context(|| {
+                    format!("cannot snapshot {path:?}; move the obstruction aside and retry")
+                });
+            }
+            Err(_) => {
                 ensure!(
                     force || dry_run,
                     "blocked path {path:?}; use --force to rescue it"
                 );
+                (None, true)
             }
+        };
+        if blocked || work != wanted || !hidden.contains(path) {
+            ensure!(
+                !staged.contains(path),
+                "base has staged changes at {path:?}; commit or unstage them before applying the directory mask"
+            );
+        }
+        if blocked || work != wanted {
             let unexpected = work.is_some() && work != repo.indexed(path, false)?;
             plans.push((path, wanted, unexpected));
         }
@@ -485,25 +557,37 @@ pub fn reconcile(repo: &Repo, dry_run: bool, force: bool) -> Result<bool> {
     let text = exclude_bytes(repo, Some(&manifest), true)?;
     let exclude_changed =
         fs::read(repo.common.join("info/exclude")).ok().as_deref() != Some(text.as_slice());
-    let flags_changed = manifest
-        .entries
+    let flags_changed = managed
         .keys()
         .any(|path| index.contains_key(path) && !hidden.contains(path));
     let changed = !plans.is_empty() || exclude_changed || flags_changed || repo.detached();
-    if !dry_run {
-        atomic_write(&repo.common.join("info/exclude"), &text)?;
-        repo.skip_many(manifest.entries.keys().map(String::as_str), true)?;
-    }
-    for (path, value, backup) in &plans {
-        if dry_run {
+    plans.sort_by_key(|(_, value, _)| value.is_some());
+    if dry_run || !changed {
+        for (path, _, _) in plans {
             crate::say!("would apply {path:?}");
-        } else {
-            repo.replace(path, value.as_ref(), *backup, force)?;
+        }
+        return Ok(changed);
+    }
+    let install = || -> Result<()> {
+        atomic_write(&repo.common.join("info/exclude"), &text)?;
+        repo.skip_many(managed.keys().map(String::as_str), true)?;
+        for (path, value, backup) in &plans {
+            repo.replace(path, value.as_ref(), *backup, force && !needs_journal)?;
+            if value.is_none() {
+                prune_opaque_parents(repo, &manifest, path)?;
+            }
             crate::say!("applied {path:?}");
         }
-    }
-    if !dry_run && repo.detached() {
-        fs::remove_file(repo.local("detached.json"))?;
+        if repo.detached() {
+            fs::remove_file(repo.local("detached.json"))?;
+        }
+        Ok(())
+    };
+    if needs_journal {
+        let paths: Vec<_> = managed.keys().cloned().collect();
+        crate::mutation::run(repo, &paths, install)?;
+    } else {
+        install()?;
     }
     Ok(changed)
 }
@@ -547,23 +631,32 @@ pub fn detach(repo: &Repo, force: bool) -> Result<i32> {
         return Ok(0);
     }
     let manifest = repo.manifest()?;
+    let files = repo.managed_files(&manifest)?;
+    let repo = &repo.with_layout(files.keys());
     validate_overlay(repo, &manifest)?;
     let mut plans = Vec::new();
-    for (path, entry) in &manifest.entries {
-        let work = repo.work(path)?;
-        let base = repo.indexed(path, false)?;
+    for (path, kind) in files {
+        let work = repo.work(&path)?;
+        let base = repo.indexed(&path, false)?;
         ensure!(
-            entry.kind != Kind::Delete || work.is_none() || work == base || force,
+            kind != Kind::Delete || work.is_none() || work == base || force,
             "whiteout {path:?} has unexpected content; use --force to rescue it"
         );
-        let saved = repo.indexed(path, true)?;
-        let known_base = work.is_some() && (work == base || work == entry.base);
-        let stage = entry.kind != Kind::Delete && work.is_some() && !(known_base && work != saved);
-        if !stage && work.is_some() && entry.kind != Kind::Delete && work != saved {
+        let mut stage = kind != Kind::Delete && work.is_some();
+        if stage
+            && (work == base
+                || manifest
+                    .entries
+                    .get(&path)
+                    .is_some_and(|entry| work == entry.base))
+            && work != repo.indexed(&path, true)?
+        {
+            stage = false;
             crate::say!("preserved saved overlay for {path:?}; working bytes match the base");
         }
-        plans.push((path.clone(), base, work, entry.kind, stage));
+        plans.push((path, base, work, kind, stage));
     }
+    plans.sort_by_key(|(_, base, ..)| base.is_some());
     let paths: Vec<_> = plans.iter().map(|(path, ..)| path.clone()).collect();
     let head = git::text(repo.overlay(["rev-parse", "HEAD"])?)?;
     let mut marker = serde_json::json!({"version":1,"complete":false,"started_unix_secs":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),"overlay_head":head,"paths":paths,"restored":[]});
@@ -582,6 +675,9 @@ pub fn detach(repo: &Repo, force: bool) -> Result<i32> {
                     *kind == Kind::Delete && work.is_some(),
                     force,
                 )?;
+                if base.is_none() {
+                    prune_opaque_parents(repo, &manifest, path)?;
+                }
             }
         }
         repo.skip_many(paths.iter().map(String::as_str), false)?;

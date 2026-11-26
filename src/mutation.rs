@@ -1,7 +1,7 @@
 use crate::{
     git,
-    model::{MANIFEST, Snapshot},
-    repo::{Repo, atomic_write, ensure_not_symlink},
+    model::{MANIFEST, Snapshot, parents, validate_path},
+    repo::{Repo, atomic_write, ensure_not_symlink, leaf_metadata},
 };
 use anyhow::{Context as _, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -23,6 +23,8 @@ struct Before {
     exclude: Option<Snapshot>,
     detached: Option<Snapshot>,
     work: BTreeMap<String, Option<Snapshot>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    directories: BTreeMap<String, bool>,
     flags: BTreeMap<String, Option<u8>>,
 }
 
@@ -66,6 +68,7 @@ fn head(repo: &Repo) -> Result<Option<String>> {
     Ok(None)
 }
 fn capture(repo: &Repo, paths: &[String]) -> Result<Before> {
+    let repo = &repo.with_layout(paths);
     let index = index_path(repo)?;
     ensure!(
         !index.with_extension("lock").exists(),
@@ -110,6 +113,7 @@ fn capture(repo: &Repo, paths: &[String]) -> Result<Before> {
         manifest: raw(&repo.root.join(MANIFEST))?,
         exclude: raw(&repo.common.join("info/exclude"))?,
         detached: raw(&repo.local("detached.json"))?,
+        directories: directory_state(repo, work.keys())?,
         work,
         flags,
     })
@@ -148,13 +152,22 @@ fn restore_raw(repo: &Repo, path: &Path, label: &str, wanted: Option<&Snapshot>)
 }
 pub fn recover(repo: &Repo) -> Result<()> {
     let state: Before = serde_json::from_slice(&fs::read(repo.local("mutation.json"))?)?;
+    let original_files = state
+        .manifest
+        .as_ref()
+        .and_then(|s| serde_json::from_slice::<crate::model::Manifest>(&s.data).ok())
+        .filter(|m| !m.opaque.is_empty() && m.validate().is_ok())
+        .map(|m| repo.managed_files(&m))
+        .transpose()?
+        .unwrap_or_default();
+    let repo = &repo.with_layout(state.work.keys().chain(original_files.keys()));
     ensure!(state.version == 1, "unsupported mutation recovery version");
     ensure!(
         head(repo)? == state.head,
         "overlay HEAD changed after the interrupted operation; preserve mutation.json and restore it manually"
     );
     for (path, value) in &state.work {
-        repo.safe_path(path)?;
+        repo.validate_leaf(path)?;
         if let Some(value) = value {
             value.validate()?;
         }
@@ -192,7 +205,7 @@ pub fn recover(repo: &Repo) -> Result<()> {
         )?;
         git::check(&output)?;
     }
-    recover_work(repo, &state.work)?;
+    recover_work(repo, &state.work, &state.directories)?;
     restore_raw(
         repo,
         &index,
@@ -241,8 +254,42 @@ pub fn recover(repo: &Repo) -> Result<()> {
     fs::remove_file(repo.local("mutation.json"))?;
     Ok(())
 }
-fn recover_work(repo: &Repo, work: &BTreeMap<String, Option<Snapshot>>) -> Result<()> {
-    for (path, value) in work {
+pub(crate) fn directory_state<'a>(
+    repo: &Repo,
+    paths: impl IntoIterator<Item = &'a String>,
+) -> Result<BTreeMap<String, bool>> {
+    let mut directories = BTreeMap::new();
+    for path in paths {
+        for dir in parents(path) {
+            if !directories.contains_key(dir) {
+                directories.insert(
+                    dir.to_owned(),
+                    leaf_metadata(&repo.root, dir)?.is_some_and(|m| m.is_dir()),
+                );
+            }
+        }
+    }
+    Ok(directories)
+}
+
+pub(crate) fn recover_work(
+    repo: &Repo,
+    work: &BTreeMap<String, Option<Snapshot>>,
+    directories: &BTreeMap<String, bool>,
+) -> Result<()> {
+    for dir in directories.keys() {
+        validate_path(dir)?;
+        let prefix = format!("{dir}/");
+        ensure!(
+            work.range(prefix.clone()..)
+                .next()
+                .is_some_and(|(p, _)| p.starts_with(&prefix)),
+            "unrelated directory in recovery snapshot {dir:?}"
+        );
+    }
+    let mut leaves: Vec<_> = work.iter().collect();
+    leaves.sort_by_key(|(_, value)| value.is_some());
+    for (path, value) in leaves {
         let current = match repo.work(path) {
             // Older recovery restores could journal an absent path whose invalid
             // filename was masked by a missing parent. There are no original bytes
@@ -260,6 +307,22 @@ fn recover_work(repo: &Repo, work: &BTreeMap<String, Option<Snapshot>>) -> Resul
         };
         if current != *value {
             repo.replace(path, value.as_ref(), current.is_some(), false)?;
+        }
+    }
+    // Recreate empty directories that a mask pruned. Remove newly created parents
+    // bottom-up, leaving later untracked files and directories with contents alone.
+    for (dir, existed) in directories {
+        if *existed && leaf_metadata(&repo.root, dir)?.is_none() {
+            fs::create_dir(repo.safe_path(dir)?)?;
+        }
+    }
+    for (dir, existed) in directories.iter().rev() {
+        if !*existed && leaf_metadata(&repo.root, dir)?.is_some_and(|m| m.is_dir()) {
+            match fs::remove_dir(repo.safe_path(dir)?) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
+                Err(error) => return Err(error.into()),
+            }
         }
     }
     Ok(())

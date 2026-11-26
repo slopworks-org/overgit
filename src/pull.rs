@@ -29,6 +29,8 @@ struct Session {
 }
 impl Session {
     fn capture(repo: &Repo, manifest: &Manifest) -> Result<Self> {
+        let files = repo.managed_files(manifest)?;
+        let repo = &repo.with_layout(files.keys());
         Ok(Self {
             version: 1,
             started_at_unix: std::time::SystemTime::now()
@@ -41,14 +43,14 @@ impl Session {
             index: fs::read(index_path(repo, true)?)?,
             base_head: base_head(repo)?,
             base_index: optional_bytes(&index_path(repo, false)?)?,
-            work: manifest
-                .entries
-                .keys()
-                .map(|path| Ok((path.clone(), repo.work(path)?)))
+            work: files
+                .into_keys()
+                .map(|path| Ok((path.clone(), repo.work(&path)?)))
                 .collect::<Result<_>>()?,
         })
     }
     fn ensure_unchanged(&self, repo: &Repo) -> Result<()> {
+        let repo = &repo.with_layout(self.work.keys());
         ensure!(self.version == 1, "unsupported pending pull version");
         ensure!(
             self.head == git::text(repo.overlay(["rev-parse", "HEAD"])?)?
@@ -161,8 +163,9 @@ fn read_session(repo: &Repo) -> Result<Session> {
     ensure!(state.version == 1, "unsupported pending pull version");
     let manifest: Manifest = serde_json::from_slice(&state.manifest)?;
     manifest.validate()?;
+    let repo = &repo.with_layout(state.work.keys());
     for (path, value) in &state.work {
-        repo.safe_path(path)?;
+        repo.validate_leaf(path)?;
         if let Some(value) = value {
             value.validate()?;
         }
@@ -560,14 +563,19 @@ fn overlay_git_dir(repo: &Repo) -> Result<std::path::PathBuf> {
 }
 
 fn preflight(repo: &Repo, previous: &Manifest, incoming: &Manifest) -> Result<()> {
-    for (path, entry) in &incoming.entries {
-        repo.safe_path(path)?;
-        if !previous.entries.contains_key(path) {
-            repo.staged_base_safe(path)?;
+    let previous_files = repo.managed_files(previous)?;
+    let incoming_files = repo.managed_files(incoming)?;
+    let repo = &repo.with_layout(previous_files.keys().chain(incoming_files.keys()));
+    for dir in incoming.opaque.difference(&previous.opaque) {
+        repo.assert_base_unstaged(dir)?;
+    }
+    for (path, kind) in incoming_files {
+        if !previous_files.contains_key(&path) {
+            repo.staged_base_safe(&path)?;
         }
         // An obstruction must fail before any original refs, indexes or files change.
-        repo.work(path)?;
-        if entry.kind == Kind::Add {
+        repo.work(&path)?;
+        if kind == Kind::Add {
             ensure!(
                 !path.contains('\n') && !path.ends_with('\r'),
                 "added path cannot be represented in Git exclude at {path:?}"
@@ -683,17 +691,26 @@ fn apply_result(
     // The original checkout was clean. Its old content remains recoverable in old HEAD,
     // and every unexpected base-side file is backed up by reconciliation before replacement.
     repo.overlay(["read-tree", new_head])?;
-    for path in previous
-        .entries
+    let incoming = repo.managed_files(manifest)?;
+    let old_files = repo.managed_files(previous)?;
+    let repo = &repo.with_layout(old_files.keys().chain(incoming.keys()));
+    let mut released = Vec::new();
+    for path in old_files
         .keys()
-        .filter(|path| !manifest.entries.contains_key(*path))
+        .filter(|path| !incoming.contains_key(*path))
     {
-        let base = repo.indexed(path, false)?;
+        released.push((path, repo.indexed(path, false)?));
+    }
+    released.sort_by_key(|(_, base)| base.is_some());
+    for (path, base) in released {
         repo.replace(path, base.as_ref(), true, false)?;
+        if base.is_none() {
+            ops::prune_opaque_parents(repo, previous, path)?;
+        }
         repo.skip(path, false)?;
     }
     atomic_write(&repo.root.join(MANIFEST), bytes)?;
-    ops::reconcile(repo, false, false)?;
+    ops::reconcile_pull(repo)?;
     let mut commands = String::from("start\n");
     for (name, reference) in new_refs {
         if !reference.symbolic.is_empty() {
@@ -734,6 +751,8 @@ struct BeforeInstall {
     head: String,
     manifest: Vec<u8>,
     work: BTreeMap<String, Option<Snapshot>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    directories: BTreeMap<String, bool>,
     overlay_index: Vec<u8>,
     #[serde(default)]
     overlay_shared_indexes: BTreeMap<String, Vec<u8>>,
@@ -750,12 +769,13 @@ impl BeforeInstall {
         incoming: &Manifest,
         head: String,
     ) -> Result<Self> {
-        let paths: BTreeSet<_> = previous
-            .entries
-            .keys()
-            .chain(incoming.entries.keys())
-            .cloned()
+        let paths: BTreeSet<_> = repo
+            .managed_files(previous)?
+            .into_keys()
+            .chain(repo.managed_files(incoming)?.into_keys())
             .collect();
+        let repo = &repo.with_layout(&paths);
+        let directories = crate::mutation::directory_state(repo, &paths)?;
         let work = paths
             .into_iter()
             .map(|path| Ok((path.clone(), repo.work(&path)?)))
@@ -769,6 +789,7 @@ impl BeforeInstall {
             head,
             manifest: fs::read(repo.root.join(MANIFEST))?,
             work,
+            directories,
             overlay_index: fs::read(index_path(repo, true)?)?,
             overlay_shared_indexes: shared_indexes(&index_path(repo, true)?)?,
             base_index: optional_bytes(&index_path(repo, false)?)?,
@@ -778,6 +799,7 @@ impl BeforeInstall {
         })
     }
     fn restore(self, repo: &Repo) -> Result<()> {
+        let repo = &repo.with_layout(self.work.keys());
         let base_lock = index_path(repo, false)?.with_file_name("index.lock");
         crate::repo::ensure_not_symlink(&base_lock)?;
         ensure!(!base_lock.exists(), "base Git index is locked");
@@ -810,10 +832,7 @@ impl BeforeInstall {
         {
             repo.rescue(MANIFEST, &current)?;
         }
-        for (path, value) in &self.work {
-            let changed = repo.work(path)? != *value;
-            repo.replace(path, value.as_ref(), changed, false)?;
-        }
+        crate::mutation::recover_work(repo, &self.work, &self.directories)?;
         atomic_write(&repo.root.join(MANIFEST), &self.manifest)?;
         atomic_write(&index, &self.overlay_index)?;
         // Restore only owned paths on the current index, preserving unrelated flags

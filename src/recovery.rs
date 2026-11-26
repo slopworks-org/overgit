@@ -377,11 +377,14 @@ fn plan(repo: &Repo, selected: &Selected, destination: Option<&Path>) -> Result<
         selected.original.clone()
     };
     let owned = manifest.entries.contains_key(&destination);
+    let whiteout = if let Some(entry) = manifest.entries.get(&destination) {
+        entry.kind == Kind::Delete
+    } else {
+        manifest.opaque_directory(&destination).is_some()
+            && repo.index_file(&destination, false)?.is_some()
+    };
     ensure!(
-        !manifest
-            .entries
-            .get(&destination)
-            .is_some_and(|entry| entry.kind == Kind::Delete),
+        !whiteout,
         "destination is an overlay whiteout; decide its ownership with existing restore/add commands first, or select another --to path"
     );
     if !owned {

@@ -20,6 +20,7 @@ fn every_command_help_works_without_git_or_a_repository() -> anyhow::Result<()> 
         "fetch",
         "pull",
         "git",
+        "base",
         "apply",
         "attach",
         "detach",

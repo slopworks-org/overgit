@@ -1,3 +1,4 @@
+mod base;
 mod bootstrap;
 mod doctor;
 mod git;
@@ -29,7 +30,7 @@ macro_rules! say {
 #[command(
     version,
     about = "An independent Git overlay in a shared working tree",
-    long_about = "An independent Git overlay in a shared working tree\n\nStart in a Git worktree: overgit init, overgit add <path>, overgit commit -m\n<message>.\nUpdate the base: overgit detach, git pull, overgit attach, overgit sync.\nUse overgit <command> --help for workflows and safety details.\nExit codes: 0 success, 1 failure, 2 usage, 3 pending sync/pull, 4 attention\nneeded.\nGit passthrough commands retain Git exit codes."
+    long_about = "An independent Git overlay in a shared working tree\n\nStart in a Git worktree: overgit init, overgit add <path>, overgit commit -m\n<message>.\nUpdate the base with overgit base pull. Run overgit sync to merge upstream\nchanges into owned files.\nUse overgit <command> --help for workflows and safety details.\nExit codes: 0 success, 1 failure, 2 usage, 3 pending sync/pull, 4 attention\nneeded.\nGit passthrough commands retain Git exit codes."
 )]
 struct Cli {
     #[arg(short = 'C', default_value = ".", help = "Run from this directory")]
@@ -193,6 +194,15 @@ enum Command {
     Pull {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
+    },
+    /// Run Git against the base, detaching and reattaching for worktree updates
+    #[command(
+        long_about = "Run Git against the base repository\n\nOvergit detaches for pull, merge, rebase, checkout, switch, reset, cherry-pick,\nrevert, stash, restore, bisect, am, apply, clean, mv and rm. Dry runs of clean,\nmv and rm pass through, as do read-only patch reports, help, stash list and\nstash show. Git aliases use their target's rule. Detach manually before shell\naliases or external commands that rewrite owned paths.\n\n  overgit base pull\n  overgit base rebase --continue\n  overgit base -- --help\n\nDuring a conflict the overlay stays detached. Finish or abort with overgit base\nto reattach, or run overgit attach once Git is idle. If Git leaves base edits on\nowned paths, review and commit or discard them with overgit base to reattach.\nA manual detach stays in effect. Run overgit sync to merge upstream changes.\nClean refuses force flags that put .overgit at risk. Use one -f, and on older\nGit set -c clean.requireForce=true before clean."
+    )]
+    Base {
+        /// Git options, subcommand and arguments
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        git_args: Vec<std::ffi::OsString>,
     },
     /// Run arbitrary Git against the overlay, bypassing overgit safeguards
     #[command(
@@ -409,6 +419,7 @@ fn main() {
 fn run(cli: Cli) -> Result<i32> {
     let cwd = cli.working_directory.canonicalize()?;
     match &cli.command {
+        Command::Base { git_args } => return base::run(&cwd, git_args),
         Command::Init { remote, branch } => {
             return bootstrap::init(&cwd, remote.as_deref(), branch);
         }
@@ -531,7 +542,7 @@ fn mutate(repo: &Repo, command: Command, quiet: bool) -> Result<i32> {
                 0
             })
         }
-        Command::Detach { force } => ops::detach(repo, force),
+        Command::Detach { force } => ops::detach(repo, force, false),
         command @ (Command::Sync { .. } | Command::Resolve { .. }) => synchronize(repo, command),
         Command::Pull { args } => pull::run(repo, &args),
         Command::Hooks { action } => bootstrap::hooks(repo, matches!(action, HookCommand::Install)),
@@ -625,6 +636,7 @@ mod help_tests {
 
     #[test]
     fn git_arguments_keep_their_help_and_option_meanings() -> anyhow::Result<()> {
+        assert!(Cli::try_parse_from(["overgit", "base", "-C", "dir", "pull", "--help"]).is_ok());
         for command in ["diff", "log", "push", "fetch", "pull", "git"] {
             for args in [
                 vec!["--", "--help"],

@@ -207,7 +207,7 @@ impl Repo {
             .context("another overgit command holds the repository lock")?;
         Ok(file)
     }
-    pub fn assert_idle(&self) -> Result<()> {
+    pub fn base_operation(&self) -> Result<Option<&'static str>> {
         for marker in [
             "MERGE_HEAD",
             "rebase-merge",
@@ -217,10 +217,15 @@ impl Repo {
             "BISECT_LOG",
             "sequencer",
         ] {
-            ensure!(
-                !self.git_dir.join(marker).exists(),
-                "base operation in progress ({marker}); finish or abort it first"
-            );
+            if self.git_dir.join(marker).try_exists()? {
+                return Ok(Some(marker));
+            }
+        }
+        Ok((!self.base(["ls-files", "--unmerged", "-z"])?.is_empty()).then_some("unmerged index"))
+    }
+    pub fn assert_idle(&self) -> Result<()> {
+        if let Some(marker) = self.base_operation()? {
+            bail!("base operation in progress ({marker}); finish or abort it first");
         }
         let sparse = git::output(
             self.base_cmd()

@@ -624,7 +624,7 @@ pub fn rescue_index_before_replacing(
     Ok(())
 }
 
-pub fn detach(repo: &Repo, force: bool) -> Result<i32> {
+pub fn detach(repo: &Repo, force: bool, auto_attach: bool) -> Result<i32> {
     repo.assert_no_sync()?;
     if repo.detached() {
         crate::say!("already detached; use attach to recover an interrupted detach");
@@ -684,6 +684,7 @@ pub fn detach(repo: &Repo, force: bool) -> Result<i32> {
         atomic_write(&repo.common.join("info/exclude"), &protection)?;
         marker["restored"] = serde_json::to_value(&paths)?;
         marker["complete"] = true.into();
+        marker["auto_attach"] = auto_attach.into();
         atomic_write(&repo.local("detached.json"), &serde_json::to_vec(&marker)?)
     })?;
     crate::say!(

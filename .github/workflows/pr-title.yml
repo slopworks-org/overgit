@@ -13,6 +13,7 @@ jobs:
     uses: slopworks-org/.github/.github/workflows/pr-title.yml@main
     with:
       scopes: |
+        base
         cli
         core
         deps

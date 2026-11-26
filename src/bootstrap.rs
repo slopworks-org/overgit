@@ -319,7 +319,7 @@ pub fn hooks(repo: &Repo, install: bool) -> Result<i32> {
             // remove the sentinel and exactly one Git record terminator afterward.
             write!(
                 wrapped,
-                "(\n  if overgit_hook_root=$(git rev-parse --show-toplevel 2>/dev/null && printf .); then\n    overgit_hook_root=${{overgit_hook_root%.}}\n    overgit_hook_root=${{overgit_hook_root%?}}\n    if [ -n \"$overgit_hook_root\" ] && [ -e \"$overgit_hook_root/.overgit/.git\" ]; then\n      {executable} -C \"$overgit_hook_root\" apply >/dev/null\n    fi\n  fi\n) </dev/null || true\n{HOOK_END}\n"
+                "(\n  if [ \"${{OVERGIT_SKIP_HOOKS:-}}\" != 1 ] && overgit_hook_root=$(git rev-parse --show-toplevel 2>/dev/null && printf .); then\n    overgit_hook_root=${{overgit_hook_root%.}}\n    overgit_hook_root=${{overgit_hook_root%?}}\n    if [ -n \"$overgit_hook_root\" ] && [ -e \"$overgit_hook_root/.overgit/.git\" ]; then\n      {executable} -C \"$overgit_hook_root\" apply >/dev/null\n    fi\n  fi\n) </dev/null || true\n{HOOK_END}\n"
             )?;
             wrapped.push_str(body);
             content = wrapped;

@@ -1,5 +1,7 @@
 #[cfg(test)]
 mod tests {
+    mod base;
+
     use std::{
         fs,
         io::Write as _,

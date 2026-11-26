@@ -1,0 +1,132 @@
+name: Build and publish Overgit
+
+on:
+  workflow_call:
+    inputs:
+      channel:
+        required: true
+        type: string
+      release_tag:
+        required: true
+        type: string
+      build_version:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  BUILD_VERSION: ${{ inputs.build_version }}
+  OVERGIT_BUILD_VERSION: ${{ inputs.build_version }}
+  RELEASE_TAG: ${{ inputs.release_tag }}
+
+jobs:
+  package:
+    name: Package (${{ matrix.os }})
+    strategy:
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5
+        with:
+          version: 2026.9.15
+      - run: mise run check
+      - run: mise exec -- bash .github/scripts/package-release.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: package-${{ matrix.os }}
+          path: target/dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Publish
+    needs: package
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: package-*
+          path: dist
+          merge-multiple: true
+
+      - name: Collect files
+        env:
+          CHANNEL: ${{ inputs.channel }}
+        working-directory: dist
+        run: |
+          case "$CHANNEL" in
+            release | main) ;;
+            *)
+              echo "::error::Unsupported channel: $CHANNEL"
+              exit 1
+              ;;
+          esac
+          shopt -s nullglob
+          archives=(overgit-v"$BUILD_VERSION"-*.tar.gz)
+          test "${#archives[@]}" -eq 2
+          sha256sum -- "${archives[@]}" > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish tagged release
+        if: inputs.channel == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        working-directory: dist
+        run: |
+          shopt -s nullglob
+          archives=(overgit-v"$BUILD_VERSION"-*.tar.gz)
+          flags=(--verify-tag --generate-notes)
+          if [[ "${BUILD_VERSION%%+*}" == *-* ]]; then
+            flags+=(--prerelease)
+          fi
+          gh release create "$RELEASE_TAG" --title "$RELEASE_TAG" "${flags[@]}" "${archives[@]}" SHA256SUMS
+
+      - name: Publish main build
+        if: inputs.channel == 'main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        working-directory: dist
+        run: |
+          shopt -s nullglob
+          archives=(overgit-v"$BUILD_VERSION"-*.tar.gz)
+          # Retain the git tag when replacing the assets on a rerun.
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release delete "$RELEASE_TAG" --yes
+          fi
+          gh release create "$RELEASE_TAG" --draft --prerelease --target "$GITHUB_SHA" \
+            --title "$BUILD_VERSION" --notes "Build of main at $GITHUB_SHA."
+          gh release upload "$RELEASE_TAG" "${archives[@]}" SHA256SUMS
+          gh release edit "$RELEASE_TAG" --draft=false --prerelease
+
+      - name: Promote main build and prune old builds
+        if: inputs.channel == 'main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # A rerun for an older commit must not roll the pointer back.
+          head=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')
+          [ "$head" = "$GITHUB_SHA" ] || exit 0
+          printf 'version=%s\ntag=%s\ncommit=%s\n' "$BUILD_VERSION" "$RELEASE_TAG" "$GITHUB_SHA" > channel.kv
+          notes="The main channel currently points to $RELEASE_TAG ($GITHUB_SHA)."
+          if gh release view channel-main >/dev/null 2>&1; then
+            gh release upload channel-main --clobber channel.kv
+            gh release edit channel-main --notes "$notes"
+          else
+            gh release create channel-main --prerelease --target "$GITHUB_SHA" --title "Main channel" \
+              --notes "$notes" channel.kv
+          fi
+
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[] | select(.prerelease and (.draft | not)) | .tag_name' > releases.txt
+          awk '/^main-[0-9]+-g[0-9a-f]+$/' releases.txt | sort -t- -k2,2nr | tail -n +6 > obsolete.txt
+          while IFS= read -r old_tag; do
+            if [ "$old_tag" != "$RELEASE_TAG" ]; then
+              gh release delete "$old_tag" --yes --cleanup-tag
+            fi
+          done < obsolete.txt

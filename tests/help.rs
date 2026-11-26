@@ -38,6 +38,7 @@ fn every_command_help_works_without_git_or_a_repository() -> anyhow::Result<()> 
         "worktree add",
         "worktree list",
         "worktree remove",
+        "update",
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_overgit"))
             .current_dir(temp.path())

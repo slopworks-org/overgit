@@ -22,4 +22,5 @@ jobs:
         hooks
         recovery
         sync
+        update
         worktree

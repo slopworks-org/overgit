@@ -11,6 +11,7 @@ mod pull;
 mod recovery;
 mod repo;
 mod sync;
+mod update;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -26,7 +27,7 @@ macro_rules! say {
     ($($arg:tt)*) => { if !$crate::QUIET.load(std::sync::atomic::Ordering::Relaxed) { println!($($arg)*); } };
 }
 
-const VERSION: &str = match option_env!("OVERGIT_BUILD_VERSION") {
+pub(crate) const VERSION: &str = match option_env!("OVERGIT_BUILD_VERSION") {
     Some(v) if !v.is_empty() => v,
     _ => env!("CARGO_PKG_VERSION"),
 };
@@ -336,6 +337,21 @@ enum Command {
         #[command(subcommand)]
         action: WorktreeCommand,
     },
+    /// Update overgit to the latest build on the configured update channel
+    #[command(
+        long_about = "Update overgit to the latest build on the configured update channel\n\nDownloads the latest verified release archive from GitHub, checks its SHA-256\nchecksum and reported version, and atomically replaces the running executable.\n\nChannels:\n  main    Latest builds from the main branch (default)\n\nExamples:\n  overgit update                  Install the latest build on the saved channel\n  overgit update --check          Check for updates without installing\n  overgit update --channel main   Select the main channel and update\n  overgit update --force          Reinstall even if already up to date\n\nThe selected channel is stored in $XDG_CONFIG_HOME/overgit/update-channel\n(or $HOME/.config/overgit/update-channel). With --check, --channel inspects\nthat channel without changing the saved setting. Requires curl and tar."
+    )]
+    Update {
+        /// Check for updates without installing or changing settings
+        #[arg(long)]
+        check: bool,
+        /// Select the update channel (saved unless --check is set)
+        #[arg(long, value_enum)]
+        channel: Option<update::Channel>,
+        /// Reinstall even if already up to date
+        #[arg(short, long, conflicts_with = "check")]
+        force: bool,
+    },
 }
 #[derive(Subcommand)]
 enum HookCommand {
@@ -424,6 +440,11 @@ fn main() {
 fn run(cli: Cli) -> Result<i32> {
     let cwd = cli.working_directory.canonicalize()?;
     match &cli.command {
+        Command::Update {
+            check,
+            channel,
+            force,
+        } => return update::run(*check, *channel, *force),
         Command::Base { git_args } => return base::run(&cwd, git_args),
         Command::Init { remote, branch } => {
             return bootstrap::init(&cwd, remote.as_deref(), branch);

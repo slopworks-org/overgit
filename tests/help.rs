@@ -59,3 +59,24 @@ fn every_command_help_works_without_git_or_a_repository() -> anyhow::Result<()> 
     assert_eq!(std::fs::read_dir(temp.path())?.count(), 0);
     Ok(())
 }
+
+#[test]
+fn version_matches_build_or_package_version() -> anyhow::Result<()> {
+    let expected = match option_env!("OVERGIT_BUILD_VERSION") {
+        Some(version) if !version.is_empty() => version,
+        _ => env!("CARGO_PKG_VERSION"),
+    };
+    let output = Command::new(env!("CARGO_BIN_EXE_overgit"))
+        .arg("--version")
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        format!("overgit {expected}")
+    );
+    Ok(())
+}

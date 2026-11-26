@@ -1,59 +1,38 @@
 name: Release
+
 on:
   push:
     tags: ["v*"]
+
 permissions:
   contents: read
+
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
-jobs:
-  package:
-    strategy:
-      matrix:
-        os: [ubuntu-24.04, macos-15]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v7
-      - uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5
-        with:
-          version: 2026.9.15
-      - run: mise run check
-      - run: mise exec -- bash .github/scripts/package-release.sh
-      - uses: actions/upload-artifact@v7
-        with:
-          name: package-${{ matrix.os }}
-          path: target/dist/*.tar.gz
-          if-no-files-found: error
 
-  publish:
-    needs: package
+jobs:
+  version:
     runs-on: ubuntu-24.04
-    permissions:
-      contents: write
+    outputs:
+      build_version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
-        with:
-          pattern: package-*
-          path: dist
-          merge-multiple: true
-      - name: Publish binaries and checksums
-        env:
-          GH_TOKEN: ${{ github.token }}
-        working-directory: dist
+      - id: version
         run: |
-          version=$(python3 -c 'import tomllib; print(tomllib.load(open("../Cargo.toml", "rb"))["package"]["version"])')
-          tag="v$version"
-          if [[ "$tag" != "$GITHUB_REF_NAME" ]]; then
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
+          if [[ "$GITHUB_REF_NAME" != "v$version" ]]; then
             echo "::error::Tag $GITHUB_REF_NAME does not match package version $version"
             exit 1
           fi
-          archives=(overgit-"$tag"-*.tar.gz)
-          test "${#archives[@]}" -eq 2
-          sha256sum "${archives[@]}" > SHA256SUMS
-          flags=(--verify-tag --generate-notes)
-          if [[ "${version%%+*}" == *-* ]]; then
-            flags+=(--prerelease)
-          fi
-          gh release create "$tag" --title "$tag" "${flags[@]}" "${archives[@]}" SHA256SUMS
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: version
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release-build.yml
+    with:
+      channel: release
+      release_tag: ${{ github.ref_name }}
+      build_version: ${{ needs.version.outputs.build_version }}

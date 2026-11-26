@@ -26,9 +26,14 @@ macro_rules! say {
     ($($arg:tt)*) => { if !$crate::QUIET.load(std::sync::atomic::Ordering::Relaxed) { println!($($arg)*); } };
 }
 
+const VERSION: &str = match option_env!("OVERGIT_BUILD_VERSION") {
+    Some(v) if !v.is_empty() => v,
+    _ => env!("CARGO_PKG_VERSION"),
+};
+
 #[derive(Parser)]
 #[command(
-    version,
+    version = VERSION,
     about = "An independent Git overlay in a shared working tree",
     long_about = "An independent Git overlay in a shared working tree\n\nStart in a Git worktree: overgit init, overgit add <path>, overgit commit -m\n<message>.\nUpdate the base with overgit base pull. Run overgit sync to merge upstream\nchanges into owned files.\nUse overgit <command> --help for workflows and safety details.\nExit codes: 0 success, 1 failure, 2 usage, 3 pending sync/pull, 4 attention\nneeded.\nGit passthrough commands retain Git exit codes."
 )]

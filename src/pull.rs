@@ -569,6 +569,13 @@ fn preflight(repo: &Repo, previous: &Manifest, incoming: &Manifest) -> Result<()
     for dir in incoming.opaque.difference(&previous.opaque) {
         repo.assert_base_unstaged(dir)?;
     }
+    repo.assert_patterns_unstaged(
+        incoming,
+        incoming
+            .patterns
+            .difference(&previous.patterns)
+            .map(String::as_str),
+    )?;
     for (path, kind) in incoming_files {
         if !previous_files.contains_key(&path) {
             repo.staged_base_safe(&path)?;

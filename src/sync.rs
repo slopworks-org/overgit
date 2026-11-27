@@ -502,7 +502,7 @@ fn plans(repo: &Repo, only: &[String], style: &str) -> Result<Vec<Planned>> {
     );
     let manifest = repo.manifest()?;
     let files = repo.managed_files(&manifest)?;
-    let staged = repo.staged_opaque_files(&manifest)?;
+    let staged = repo.staged_masked_files(&manifest)?;
     let repo = &repo.with_layout(files.keys());
     for path in only {
         ensure!(
@@ -510,10 +510,10 @@ fn plans(repo: &Repo, only: &[String], style: &str) -> Result<Vec<Planned>> {
             "overlay does not own {path:?}"
         );
     }
-    let skipped = if manifest.opaque.is_empty() {
-        BTreeSet::new()
-    } else {
+    let skipped = if manifest.has_masks() {
         repo.skipped()?
+    } else {
+        BTreeSet::new()
     };
     files
         .into_keys()
@@ -524,7 +524,7 @@ fn plans(repo: &Repo, only: &[String], style: &str) -> Result<Vec<Planned>> {
             }
             let before = repo.work(&path)?;
             let action = if before.is_some() || !skipped.contains(&path) {
-                ensure!(!staged.contains(&path), "base has staged changes at {path:?}; commit or unstage them before syncing the directory mask");
+                ensure!(!staged.contains(&path), "base has staged changes at {path:?}; commit or unstage them before syncing the mask");
                 Action::Hide
             } else {
                 Action::None
@@ -960,7 +960,7 @@ pub fn resolve(repo: &Repo, paths: &[String], decision: Option<&str>, force: boo
         let drop = matches!(decision, Some("drop"))
             || (matches!(pending.situation, Situation::Deleted | Situation::Collision)
                 && matches!(decision, Some("take-upstream")));
-        let hidden = drop && manifest.opaque_directory(&path).is_some();
+        let hidden = drop && manifest.is_masked(&path);
         if hidden {
             value = None;
         }

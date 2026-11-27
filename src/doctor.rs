@@ -201,14 +201,19 @@ fn opaque_context(
     manifest: &Manifest,
     problems: &mut Vec<Problem>,
 ) -> Result<BTreeSet<String>> {
-    let staged = repo.staged_opaque_files(manifest)?;
+    let staged = repo.staged_masked_files(manifest)?;
     for path in &staged {
+        let message = if manifest.opaque_directory(path).is_some() {
+            "base has staged changes inside an opaque directory"
+        } else {
+            "base has staged changes matching a delete pattern"
+        };
         problems.push(problem(
             "base-index-divergence",
             Some(path),
             false,
-            "base has staged changes inside an opaque directory",
-            "commit or unstage the base changes before repairing the directory mask",
+            message,
+            "commit or unstage the base changes before repairing the mask",
         ));
     }
     for dir in &manifest.opaque {
@@ -219,6 +224,16 @@ fn opaque_context(
             fixable: false,
             message: "base files in this directory are hidden while attached".into(),
             hint: "use restore on the directory to expose its base files",
+        });
+    }
+    for pattern in &manifest.patterns {
+        problems.push(Problem {
+            severity: Severity::Info,
+            code: "delete-pattern",
+            path: Some(pattern.clone()),
+            fixable: false,
+            message: "base files matching this pattern are hidden while attached".into(),
+            hint: "use restore --pattern to expose matching base files",
         });
     }
     Ok(staged)
@@ -651,12 +666,35 @@ fn check_opaque_file(
     fix: bool,
     problems: &mut Vec<Problem>,
 ) -> Result<()> {
-    if let Some(work) = repo.work(path)? {
+    if !repo.masked_leaf(path)?
+        && let Some(actual) = different_case(repo, path)?
+    {
         problems.push(problem(
-            "opaque-file-visible",
+            "path-case-mismatch",
+            Some(path),
+            false,
+            format!("disk path is spelled {actual:?}"),
+            "review the path spelling before applying or reconstructing ownership",
+        ));
+        return Ok(());
+    }
+    if let Some(work) = repo.work(path)? {
+        let (code, message) = if manifest.opaque_directory(path).is_some() {
+            (
+                "opaque-file-visible",
+                "base file is visible inside an opaque directory",
+            )
+        } else {
+            (
+                "pattern-file-visible",
+                "base file matching a pattern is visible",
+            )
+        };
+        problems.push(problem(
+            code,
             Some(path),
             true,
-            "base file is visible inside an opaque directory",
+            message,
             "run sync or doctor --fix to hide it and back up any local edits",
         ));
         if fix {

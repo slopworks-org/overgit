@@ -15,6 +15,7 @@ mod tests {
             "GIT_OBJECT_DIRECTORY",
             "GIT_ALTERNATE_OBJECT_DIRECTORIES",
             "GIT_COMMON_DIR",
+            "GIT_PREFIX",
             "GIT_CONFIG",
             "GIT_CONFIG_GLOBAL",
             "GIT_CONFIG_SYSTEM",
@@ -25,7 +26,13 @@ mod tests {
         }
         command
             .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_ATTR_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "Pattern Test")
+            .env("GIT_AUTHOR_EMAIL", "pattern@example.invalid")
+            .env("GIT_COMMITTER_NAME", "Pattern Test")
+            .env("GIT_COMMITTER_EMAIL", "pattern@example.invalid")
             .env("GIT_TERMINAL_PROMPT", "0");
         command
     }

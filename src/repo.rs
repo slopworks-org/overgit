@@ -451,15 +451,15 @@ impl Repo {
         }
         Ok(None)
     }
-    /// Expand directory masks against this worktree's index, including new base files.
-    /// Git paths outside the masks may contain arbitrary bytes.
+    /// Expand opaque directory and pattern masks against this worktree's index,
+    /// including new base files. Git paths outside masks may contain arbitrary bytes.
     pub fn managed_files(&self, manifest: &Manifest) -> Result<BTreeMap<String, Kind>> {
         let mut files: BTreeMap<_, _> = manifest
             .entries
             .iter()
             .map(|(path, entry)| (path.clone(), entry.kind))
             .collect();
-        if manifest.opaque.is_empty() {
+        if !manifest.has_masks() {
             return Ok(files);
         }
         let mut directories = BTreeMap::new();
@@ -483,25 +483,31 @@ impl Repo {
                     std::str::from_utf8(raw)
                         .context("non-UTF-8 base path above an opaque directory")?,
                 );
-                continue;
             }
+            let mut matched = false;
             for parent in parents(&path).chain([path.as_ref()]) {
                 if let Some(dir) = directories.get(&path_identity(parent)) {
                     ensure!(
                         *dir == parent,
                         "ambiguous base path {path:?} under opaque directory {dir:?}"
                     );
-                    let path = std::str::from_utf8(raw)
-                        .context("non-UTF-8 base path inside an opaque directory")?;
-                    validate_path(path)?;
-                    ensure!(header.ends_with(b" 0"), "unmerged base index at {path:?}");
-                    ensure!(
-                        !header.starts_with(b"160000 "),
-                        "submodules are unsupported at {path:?}"
-                    );
-                    files.entry(path.to_owned()).or_insert(Kind::Delete);
+                    matched = true;
                     break;
                 }
+            }
+            if !matched && manifest.matching_pattern(&path).is_some() {
+                matched = true;
+            }
+            if matched {
+                let path = std::str::from_utf8(raw)
+                    .context("non-UTF-8 base path matched by overlay mask")?;
+                validate_path(path)?;
+                ensure!(header.ends_with(b" 0"), "unmerged base index at {path:?}");
+                ensure!(
+                    !header.starts_with(b"160000 "),
+                    "submodules are unsupported at {path:?}"
+                );
+                files.entry(path.to_owned()).or_insert(Kind::Delete);
             }
         }
         for dir in &manifest.opaque {
@@ -527,7 +533,7 @@ impl Repo {
         for path in files.keys() {
             ensure!(
                 leaves.insert(path_identity(path), path).is_none(),
-                "case or Unicode collision at {path:?} in opaque layout"
+                "case or Unicode collision at {path:?} in masked layout"
             );
         }
         for path in files.keys() {
@@ -793,19 +799,36 @@ impl Repo {
         );
         Ok(())
     }
-    pub fn staged_opaque_files(&self, manifest: &Manifest) -> Result<BTreeSet<String>> {
-        if manifest.opaque.is_empty() {
+    pub fn staged_masked_files(&self, manifest: &Manifest) -> Result<BTreeSet<String>> {
+        if !manifest.has_masks() {
             return Ok(BTreeSet::new());
         }
         Ok(self
             .base(["diff", "--cached", "--no-renames", "--name-only", "-z"])?
             .split(|byte| *byte == 0)
             .filter_map(|p| std::str::from_utf8(p).ok())
-            .filter(|p| {
-                !manifest.entries.contains_key(*p) && manifest.opaque_directory(p).is_some()
-            })
+            .filter(|p| !manifest.entries.contains_key(*p) && manifest.is_masked(p))
             .map(str::to_owned)
             .collect())
+    }
+    pub fn assert_patterns_unstaged<'a>(
+        &self,
+        manifest: &Manifest,
+        patterns: impl IntoIterator<Item = &'a str>,
+    ) -> Result<()> {
+        let patterns: Vec<_> = patterns.into_iter().collect();
+        if patterns.is_empty() {
+            return Ok(());
+        }
+        for path in self.staged_masked_files(manifest)? {
+            ensure!(
+                !patterns
+                    .iter()
+                    .any(|pattern| crate::model::matches_pattern(pattern, &path)),
+                "base has staged changes at {path:?}; commit or unstage them first"
+            );
+        }
+        Ok(())
     }
     pub fn staged_base_safe(&self, path: &str) -> Result<()> {
         self.assert_base_unstaged(path)?;

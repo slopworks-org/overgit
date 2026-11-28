@@ -380,8 +380,7 @@ fn plan(repo: &Repo, selected: &Selected, destination: Option<&Path>) -> Result<
     let whiteout = if let Some(entry) = manifest.entries.get(&destination) {
         entry.kind == Kind::Delete
     } else {
-        manifest.opaque_directory(&destination).is_some()
-            && repo.index_file(&destination, false)?.is_some()
+        manifest.is_masked(&destination) && repo.index_file(&destination, false)?.is_some()
     };
     ensure!(
         !whiteout,

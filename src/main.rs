@@ -88,40 +88,54 @@ enum Command {
         #[arg(required = true)]
         paths: Vec<PathBuf>,
     },
-    /// Hide base files, make directories opaque, or remove overlay additions
+    /// Hide base files, make directories opaque, add pattern masks, or remove overlay additions
     #[command(
-        long_about = "Hide base files, make directories opaque, or remove overlay additions\n\nA base file becomes a whiteout. Removing a directory makes it opaque. Attach, apply, and sync\nhide the current base files beneath it, including new files from upstream.\nUntracked files are preserved.\n\nTo replace a project directory with your own files:\n  overgit rm .agents\n  # Create your replacement files in .agents/\n  overgit add .agents\n  overgit commit -m \"replace project agents\"\n\nRemoving a replacement hides the base file again. Use overgit restore .agents\nto remove the directory rule and restore the current base files."
+        long_about = "Hide base files, make directories opaque, add pattern masks, or remove overlay additions\n\nA base file becomes a whiteout. Removing a directory makes it opaque. --pattern\nrecords a gitignore-style glob rule (patterns without '/' match filenames at any\ndepth, e.g. SPEC.md; patterns with '/' match repository-relative paths, with\n'**', '*', '?' and '[...]' supported). Attach, apply, and sync hide matching\nbase files, including new files from upstream. Untracked files are preserved.\n\nTo replace a project directory with your own files:\n  overgit rm .agents\n  # Create your replacement files in .agents/\n  overgit add .agents\n  overgit commit -m \"replace project agents\"\n\nTo hide every SPEC.md tracked by the base anywhere in the repository:\n  overgit rm --pattern SPEC.md\n  overgit commit -m \"hide spec files\"\n\nRemoving a replacement hides the base file again. Use overgit restore .agents\nor overgit restore --pattern SPEC.md to remove a rule and restore base files."
     )]
     Rm {
         #[arg(short, long, help = "Back up uncommitted content before removing it")]
         force: bool,
-        #[arg(required = true)]
+        #[arg(
+            short = 'p',
+            long = "pattern",
+            value_name = "PATTERN",
+            help = "Hide tracked base files matching a gitignore-style glob pattern"
+        )]
+        patterns: Vec<String>,
+        #[arg(required_unless_present = "patterns")]
         paths: Vec<PathBuf>,
     },
-    /// Give paths back to the base
+    /// Give paths or pattern masks back to the base
     #[command(
-        long_about = "Give paths back to the base\n\nRelinquishes ownership and restores base content. Overlay additions are removed\nunless --keep-file is given. To release an opaque directory and its replacements, run\n  overgit restore .agents\nThis restores all current base files in .agents.\nRestoring one replacement inside it leaves the directory rule in effect.\nFor a backup, use overgit recovery restore."
+        long_about = "Give paths or pattern masks back to the base\n\nRelinquishes ownership and restores base content. Overlay additions are removed\nunless --keep-file is given. To release an opaque directory and its replacements, run\n  overgit restore .agents\nTo remove a pattern mask and restore base files hidden only by it, run\n  overgit restore --pattern SPEC.md\nExplicitly owned entries matching the pattern stay owned. Restoring one\nreplacement under an active mask leaves the mask in effect.\nFor a backup, use overgit recovery restore."
     )]
     Restore {
         #[arg(short, long, help = "Back up uncommitted content before replacing it")]
         force: bool,
         #[arg(
             long,
-            conflicts_with = "paths",
+            conflicts_with_all = ["paths", "patterns"],
             help = "Relinquish all overlay ownership"
         )]
         all: bool,
         #[arg(
             long,
-            help = "Keep overlay additions in the working tree unless a directory mask hides the base file"
+            help = "Keep overlay additions in the working tree unless a mask hides the base file"
         )]
         keep_file: bool,
-        #[arg(required_unless_present = "all")]
+        #[arg(
+            short = 'p',
+            long = "pattern",
+            value_name = "PATTERN",
+            help = "Remove a pattern rule and restore matching base files"
+        )]
+        patterns: Vec<String>,
+        #[arg(required_unless_present_any = ["all", "patterns"])]
         paths: Vec<PathBuf>,
     },
-    /// List paths owned by the overlay
+    /// List paths and rules owned by the overlay
     List {
-        #[arg(long, value_parser = ["add", "override", "delete", "opaque"])]
+        #[arg(long, value_parser = ["add", "override", "delete", "opaque", "pattern"])]
         /// Filter by ownership kind
         kind: Option<String>,
         #[arg(long)]
@@ -221,7 +235,7 @@ enum Command {
     /// Rebuild overlay files and local Git state; attach remounts a detached overlay
     #[command(alias = "attach")]
     #[command(
-        long_about = "Rebuild overlay files and local Git state; attach remounts a detached overlay\n\nAlso available as attach. Restores saved overlay bytes and local Git state.\nAttach also hides current base files under opaque directories.\nModified owned files are backed up before replacement. Use doctor --fix to\nrepair drift while preserving ordinary edits.\n\nBase update workflow:\n  overgit detach\n  git pull\n  overgit attach\n  overgit sync\n\nGit clean -xfd or stash -a can remove additions; apply restores saved content.\nGit clean -xffd can delete the overlay itself and its backups."
+        long_about = "Rebuild overlay files and local Git state; attach remounts a detached overlay\n\nAlso available as attach. Restores saved overlay bytes and local Git state.\nAttach also hides current base files under opaque directories or delete patterns.\nModified owned files are backed up before replacement. Use doctor --fix to\nrepair drift while preserving ordinary edits.\n\nBase update workflow:\n  overgit detach\n  git pull\n  overgit attach\n  overgit sync\n\nGit clean -xfd or stash -a can remove additions; apply restores saved content.\nGit clean -xffd can delete the overlay itself and its backups."
     )]
     Apply {
         #[arg(
@@ -233,7 +247,7 @@ enum Command {
         #[arg(
             short,
             long,
-            help = "Move obstructing directories into recovery backups when attached without directory masks"
+            help = "Move obstructing directories into recovery backups when attached without masks"
         )]
         force: bool,
     },
@@ -251,7 +265,7 @@ enum Command {
     },
     /// Three-way merge current base revisions into the overlay
     #[command(
-        long_about = "Three-way merge current base revisions into the overlay\n\nAfter detach, updating base Git, and attach, merge current base HEAD changes\ninto owned files. Sync hides new base files under opaque directories and\nmerges changes to explicit replacements. Text conflicts get markers; binary, symlink, deletion and\naddition collisions require explicit decisions.\n\n  overgit sync --dry-run\n  overgit sync\n  overgit resolve <path>          After editing conflict markers\n  overgit resolve --keep <path>   Keep your version\n  overgit sync --continue\n\nUse resolve --help for other decisions. --abort restores pre-sync state and\nrescues edits made during resolution. Exit 3 means pending decisions; exit 4\ncan mean missing local inputs, requiring apply first. Finish or abort sync\nbefore commit, detach, apply or pull."
+        long_about = "Three-way merge current base revisions into the overlay\n\nAfter detach, updating base Git, and attach, merge current base HEAD changes\ninto owned files. Sync hides new base files under opaque directories or delete\npatterns and merges changes to explicit replacements. Text conflicts get markers;\nbinary, symlink, deletion and addition collisions require explicit decisions.\n\n  overgit sync --dry-run\n  overgit sync\n  overgit resolve <path>          After editing conflict markers\n  overgit resolve --keep <path>   Keep your version\n  overgit sync --continue\n\nUse resolve --help for other decisions. --abort restores pre-sync state and\nrescues edits made during resolution. Exit 3 means pending decisions; exit 4\ncan mean missing local inputs, requiring apply first. Finish or abort sync\nbefore commit, detach, apply or pull."
     )]
     Sync {
         #[arg(short = 'n', long, conflicts_with_all = ["cont", "abort"])]
@@ -298,7 +312,7 @@ enum Command {
     },
     /// Diagnose local state; fix repairs safe drift while retaining normal edits
     #[command(
-        long_about = "Diagnose local state; fix repairs safe drift while retaining normal edits\n\nUse doctor --fix after an interrupted mutation. Safe repairs preserve normal\nlocal edits; apply instead restores saved bytes. Recovery refuses to overwrite\na changed HEAD or unresolved external overlay merge.\n\n--rebuild explicitly reconstructs lost ownership and resets unknown fork\npoints. Recovering whiteouts and opaque directory rules requires a surviving\nmanifest or a copy from overlay history. Recovery entries are\nreported without reading or validating payloads; inspect them with recovery\ninspect. Warnings exit 4; informational context does not fail the command."
+        long_about = "Diagnose local state; fix repairs safe drift while retaining normal edits\n\nUse doctor --fix after an interrupted mutation. Safe repairs preserve normal\nlocal edits; apply instead restores saved bytes. Recovery refuses to overwrite\na changed HEAD or unresolved external overlay merge.\n\n--rebuild explicitly reconstructs lost ownership and resets unknown fork\npoints. Recovering whiteouts, opaque directories and pattern rules requires a\nsurviving manifest or a copy from overlay history. Recovery entries are\nreported without reading or validating payloads; inspect them with recovery\ninspect. Warnings exit 4; informational context does not fail the command."
     )]
     Doctor {
         #[arg(long, help = "Repair safe drift and recover interrupted mutations")]
@@ -526,15 +540,21 @@ fn run(cli: Cli) -> Result<i32> {
 fn mutate(repo: &Repo, command: Command, quiet: bool) -> Result<i32> {
     match command {
         Command::Add { paths, force } => ops::add(repo, &paths, force),
-        Command::Rm { paths, force } => ops::remove(repo, &paths, force, ops::Removal::Whiteout),
+        Command::Rm {
+            paths,
+            patterns,
+            force,
+        } => ops::remove(repo, &paths, &patterns, force, ops::Removal::Whiteout),
         Command::Restore {
             paths,
+            patterns,
             force,
             all,
             keep_file,
         } => ops::remove(
             repo,
             &paths,
+            &patterns,
             force,
             ops::Removal::Restore { all, keep_file },
         ),

@@ -270,7 +270,7 @@ pub fn add(repo: &Repo, inputs: &[PathBuf], force: bool) -> Result<i32> {
         content.push((path, value));
     }
     manifest.validate()?;
-    if !manifest.opaque.is_empty() {
+    if manifest.has_masks() {
         repo.managed_files(&manifest)?;
     }
     let protection = exclude_bytes(repo, Some(&manifest), true)?;
@@ -300,18 +300,31 @@ fn select_removals(
     repo: &Repo,
     manifest: &mut Manifest,
     inputs: &[PathBuf],
+    patterns: &[String],
     action: Removal,
 ) -> Result<BTreeSet<String>> {
     let mut candidates: BTreeSet<_> = repo.managed_files(manifest)?.into_keys().collect();
     if let Removal::Restore { all: true, .. } = action {
         manifest.opaque.clear();
+        manifest.patterns.clear();
         return Ok(candidates);
     }
+    let previous = manifest.clone();
     let remove = matches!(action, Removal::Whiteout);
     if remove {
+        for pattern in patterns {
+            crate::model::validate_pattern(pattern)?;
+            manifest.patterns.insert(pattern.clone());
+        }
         candidates.extend(repo.index(false)?.into_keys());
+    } else {
+        for pattern in patterns {
+            ensure!(
+                manifest.patterns.remove(pattern),
+                "no matching pattern rule {pattern:?}"
+            );
+        }
     }
-    let original_dirs = manifest.opaque.clone();
     let scopes: Vec<_> = inputs
         .iter()
         .map(|input| repo.relative_path(input))
@@ -320,14 +333,27 @@ fn select_removals(
         manifest
             .opaque
             .retain(|dir| !scopes.iter().any(|scope| Path::new(dir).starts_with(scope)));
-        candidates.retain(|path| {
-            manifest.entries.contains_key(path) || manifest.opaque_directory(path).is_none()
-        });
+        candidates.retain(|path| manifest.entries.contains_key(path) || !manifest.is_masked(path));
     }
     let mut paths = BTreeSet::new();
+    for pattern in patterns {
+        for candidate in candidates.iter().filter(|p| {
+            crate::model::matches_pattern(pattern, p)
+                && if remove {
+                    manifest
+                        .entries
+                        .get(*p)
+                        .map_or(!previous.is_masked(p), |e| e.kind == Kind::Delete)
+                } else {
+                    !manifest.entries.contains_key(*p)
+                }
+        }) {
+            paths.insert(candidate.clone());
+        }
+    }
     for path in scopes {
         let selected = |candidate: &str| Path::new(candidate).starts_with(&path);
-        let mut directory = original_dirs.iter().any(|dir| selected(dir));
+        let mut directory = previous.opaque.iter().any(|dir| selected(dir));
         // managed_files already validated the masks being released, including
         // those with no remaining leaves below a new base file.
         if !path.is_empty() && (remove || !directory) {
@@ -337,12 +363,15 @@ fn select_removals(
             directory |= *candidate != path;
             paths.insert(candidate.clone());
         }
-        if !remove
-            && !directory
-            && !candidates.contains(&path)
-            && let Some(dir) = manifest.opaque_directory(&path)
-        {
-            anyhow::bail!("restore opaque directory {dir:?} to expose base files at {path:?}");
+        if !remove && !directory && !candidates.contains(&path) {
+            if let Some(dir) = manifest.opaque_directory(&path) {
+                anyhow::bail!("restore opaque directory {dir:?} to expose base files at {path:?}");
+            }
+            if let Some(pattern) = manifest.matching_pattern(&path) {
+                anyhow::bail!(
+                    "restore pattern {pattern:?} with --pattern to expose base files at {path:?}"
+                );
+            }
         }
         ensure!(
             directory || candidates.contains(&path),
@@ -368,7 +397,13 @@ pub fn prune_opaque_parents(repo: &Repo, manifest: &Manifest, path: &str) -> Res
     repo.prune_parents(path, root)
 }
 
-pub fn remove(repo: &Repo, inputs: &[PathBuf], force: bool, action: Removal) -> Result<i32> {
+pub fn remove(
+    repo: &Repo,
+    inputs: &[PathBuf],
+    patterns: &[String],
+    force: bool,
+    action: Removal,
+) -> Result<i32> {
     let restore = matches!(action, Removal::Restore { .. });
     let keep_file = matches!(
         action,
@@ -381,7 +416,13 @@ pub fn remove(repo: &Repo, inputs: &[PathBuf], force: bool, action: Removal) -> 
     repo.assert_no_sync()?;
     let previous = repo.manifest()?;
     let mut manifest = previous.clone();
-    let paths = select_removals(repo, &mut manifest, inputs, action)?;
+    let paths = select_removals(repo, &mut manifest, inputs, patterns, action)?;
+    if !restore {
+        repo.assert_patterns_unstaged(&manifest, patterns.iter().map(String::as_str))?;
+    }
+    if paths.is_empty() && manifest == previous {
+        return Ok(0);
+    }
     let repo = &repo.with_layout(repo.managed_files(&previous)?.keys().chain(&paths));
     let mut plans = Vec::new();
     for path in paths {
@@ -392,7 +433,7 @@ pub fn remove(repo: &Repo, inputs: &[PathBuf], force: bool, action: Removal) -> 
         let clean = if let Some(entry) = prior {
             work.is_none() || (entry.kind != Kind::Delete && work == repo.indexed(&path, true)?)
         } else {
-            work == base || (previous.opaque_directory(&path).is_some() && work.is_none())
+            work == base || (previous.is_masked(&path) && work.is_none())
         };
         ensure!(
             clean || force,
@@ -401,17 +442,17 @@ pub fn remove(repo: &Repo, inputs: &[PathBuf], force: bool, action: Removal) -> 
         if !restore {
             repo.staged_base_safe(&path)?;
         }
-        let opaque = manifest.opaque_directory(&path).is_some();
-        let value = if restore && !opaque {
+        let masked = manifest.is_masked(&path);
+        let value = if restore && !masked {
             base.clone()
         } else {
             None
         };
         let keep = restore
             && keep_file
-            && (!opaque || base.is_none())
+            && (!masked || base.is_none())
             && prior.is_some_and(|entry| entry.kind == Kind::Add);
-        let entry = if !restore && !opaque && base.is_some() {
+        let entry = if !restore && !masked && base.is_some() {
             Some(Entry {
                 kind: Kind::Delete,
                 base: prior.and_then(|entry| entry.base.clone()).or(base),
@@ -458,6 +499,16 @@ pub fn remove(repo: &Repo, inputs: &[PathBuf], force: bool, action: Removal) -> 
     for (path, ..) in plans {
         crate::say!("{} {path:?}", if restore { "restored" } else { "removed" });
     }
+    report_mask_changes(repo, &previous, &manifest, restore)?;
+    Ok(0)
+}
+
+fn report_mask_changes(
+    repo: &Repo,
+    previous: &Manifest,
+    manifest: &Manifest,
+    restore: bool,
+) -> Result<()> {
     for dir in manifest.opaque.difference(&previous.opaque) {
         crate::say!("marked directory {dir:?} opaque");
     }
@@ -467,10 +518,16 @@ pub fn remove(repo: &Repo, inputs: &[PathBuf], force: bool, action: Removal) -> 
         } else {
             // A nested mask can outlive its last base file. There may be no
             // concrete leaves in the transaction to prune its empty parents.
-            prune_opaque_parents(repo, &manifest, dir)?;
+            prune_opaque_parents(repo, manifest, dir)?;
         }
     }
-    Ok(0)
+    for pattern in manifest.patterns.difference(&previous.patterns) {
+        crate::say!("added pattern {pattern:?}");
+    }
+    for pattern in previous.patterns.difference(&manifest.patterns) {
+        crate::say!("restored pattern {pattern:?}");
+    }
+    Ok(())
 }
 
 pub fn validate_overlay(repo: &Repo, manifest: &Manifest) -> Result<()> {
@@ -517,10 +574,10 @@ fn mount(repo: &Repo, dry_run: bool, force: bool, journal: bool) -> Result<bool>
     let repo = &repo.with_layout(managed.keys());
     validate_overlay(repo, &manifest)?;
     let hidden = repo.skipped()?;
-    let staged = repo.staged_opaque_files(&manifest)?;
+    let staged = repo.staged_masked_files(&manifest)?;
     let index = repo.index(false)?;
     let mut plans = Vec::new();
-    let needs_journal = journal && (repo.detached() || !manifest.opaque.is_empty());
+    let needs_journal = journal && (repo.detached() || manifest.has_masks());
     for (path, kind) in &managed {
         repo.validate_leaf(path)?;
         let wanted = if *kind == Kind::Delete {
@@ -546,7 +603,7 @@ fn mount(repo: &Repo, dry_run: bool, force: bool, journal: bool) -> Result<bool>
         if blocked || work != wanted || !hidden.contains(path) {
             ensure!(
                 !staged.contains(path),
-                "base has staged changes at {path:?}; commit or unstage them before applying the directory mask"
+                "base has staged changes at {path:?}; commit or unstage them before applying the mask"
             );
         }
         if blocked || work != wanted {

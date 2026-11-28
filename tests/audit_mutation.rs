@@ -239,6 +239,42 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_pattern_rm_restores_files_flags_and_previous_whiteouts() {
+        let sandbox = Sandbox::new();
+        let root = &sandbox.root;
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        fs::write(root.join("SPEC.md"), b"root spec").unwrap();
+        fs::write(root.join("a/b/SPEC.md"), b"nested spec").unwrap();
+        sandbox.git(&["add", "SPEC.md", "a/b/SPEC.md"]);
+        sandbox.git(&["commit", "-m", "add specs"]);
+        sandbox.cli(&["rm", "SPEC.md"], 0);
+        let manifest = fs::read(root.join(".overgit/manifest.json")).unwrap();
+        let flags = sandbox.git(&["ls-files", "-v", "-z"]).stdout;
+        let overlay = sandbox.cli(&["git", "ls-files", "--stage", "-z"], 0).stdout;
+        assert_eq!(
+            sandbox
+                .injected(&["rm", "--pattern", "SPEC.md"], "kill")
+                .status
+                .signal(),
+            Some(9)
+        );
+        assert!(!root.join("a/b/SPEC.md").exists());
+        sandbox.cli(&["doctor", "--fix"], 0);
+        assert!(!root.join("SPEC.md").exists());
+        assert_eq!(fs::read(root.join("a/b/SPEC.md")).unwrap(), b"nested spec");
+        assert_eq!(
+            fs::read(root.join(".overgit/manifest.json")).unwrap(),
+            manifest
+        );
+        assert_eq!(sandbox.git(&["ls-files", "-v", "-z"]).stdout, flags);
+        assert_eq!(
+            sandbox.cli(&["git", "ls-files", "--stage", "-z"], 0).stdout,
+            overlay
+        );
+        assert!(!root.join(".overgit/local/mutation.json").exists());
+    }
+
+    #[test]
     fn killed_mid_add_can_recover_without_losing_original_bytes() {
         let sandbox = Sandbox::new();
         let before_index = fs::read(sandbox.root.join(".overgit/.git/index")).unwrap();

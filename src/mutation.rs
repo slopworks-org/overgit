@@ -156,7 +156,7 @@ pub fn recover(repo: &Repo) -> Result<()> {
         .manifest
         .as_ref()
         .and_then(|s| serde_json::from_slice::<crate::model::Manifest>(&s.data).ok())
-        .filter(|m| !m.opaque.is_empty() && m.validate().is_ok())
+        .filter(|m| m.has_masks() && m.validate().is_ok())
         .map(|m| repo.managed_files(&m))
         .transpose()?
         .unwrap_or_default();

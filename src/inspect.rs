@@ -21,7 +21,8 @@ pub fn list(repo: &Repo, kind: Option<&str>, porcelain: bool) -> Result<i32> {
         .iter()
         .map(|(path, entry)| (path, entry.kind.name()));
     let dirs = manifest.opaque.iter().map(|dir| (dir, "opaque"));
-    for (path, name) in files.chain(dirs) {
+    let patterns = manifest.patterns.iter().map(|pattern| (pattern, "pattern"));
+    for (path, name) in files.chain(dirs).chain(patterns) {
         if kind.is_some_and(|kind| name != kind) {
             continue;
         }
@@ -46,6 +47,8 @@ pub fn which(repo: &Repo, paths: &[PathBuf], porcelain: bool) -> Result<i32> {
             || (index.contains_key(&path) && manifest.opaque_directory(&path).is_some())
         {
             ("overlay", "opaque")
+        } else if index.contains_key(&path) && manifest.matching_pattern(&path).is_some() {
+            ("overlay", "pattern")
         } else {
             outside = true;
             (
@@ -166,8 +169,7 @@ fn base_changes(
         } else {
             None
         };
-        if manifest.entries.contains_key(path.as_ref())
-            || (xy != "??" && manifest.opaque_directory(&path).is_some())
+        if manifest.entries.contains_key(path.as_ref()) || (xy != "??" && manifest.is_masked(&path))
         {
             warnings.push(format!(
                 "base can see owned path {path:?} ({xy}); run doctor"
@@ -243,12 +245,7 @@ fn render_status(repo: &Repo, report: &Value, short: bool, all: bool) -> Result<
             );
         }
     }
-    let opaque = report["opaque"]
-        .as_array()
-        .context("opaque directories are missing")?;
-    for dir in opaque {
-        crate::say!("opaque   {:?}", dir.as_str().unwrap_or("?"));
-    }
+    let mask_count = render_masks(report)?;
     for file in files {
         if !all
             && file["staged"] == false
@@ -295,11 +292,25 @@ fn render_status(repo: &Repo, report: &Value, short: bool, all: bool) -> Result<
     if !short {
         crate::say!(
             "{} owned paths; {} base worktrees",
-            files.len() + opaque.len(),
+            files.len() + mask_count,
             ops::worktree_roots(repo)?.len()
         );
     }
     Ok(())
+}
+
+fn render_masks(report: &Value) -> Result<usize> {
+    let mut count = 0;
+    for (label, key) in [("opaque", "opaque"), ("pattern", "patterns")] {
+        let items = report[key]
+            .as_array()
+            .with_context(|| format!("{key} are missing"))?;
+        count += items.len();
+        for item in items {
+            crate::say!("{label:<8} {:?}", item.as_str().unwrap_or("?"));
+        }
+    }
+    Ok(count)
 }
 
 fn render_pull_blocked(report: &Value) -> Result<()> {
@@ -333,7 +344,13 @@ fn render_diagnostics(report: &Value) -> Result<()> {
         .as_array()
         .context("status diagnostics are missing")?
         .iter()
-        .filter(|finding| finding["severity"] == "info" && finding["code"] != "opaque-directory")
+        .filter(|finding| {
+            finding["severity"] == "info"
+                && !matches!(
+                    finding["code"].as_str(),
+                    Some("opaque-directory" | "delete-pattern")
+                )
+        })
     {
         crate::say!(
             "info {} {}{}\n  {}",
@@ -398,7 +415,7 @@ pub fn status(repo: &Repo, short: bool, all: bool, porcelain: bool) -> Result<i3
     } else {
         None
     };
-    let report = json!({"version":2,"base":base,"overlay":overlay,"detached":repo.detached(),"detach":detach,"pull":pull,"sync_in_progress":repo.local("sync.json").exists(),"sync_pending":pending,"files":files,"opaque":manifest.opaque,"base_changes":changes,"pull_blocked":blocked,"warnings":warnings,"problems":problems});
+    let report = json!({"version":2,"base":base,"overlay":overlay,"detached":repo.detached(),"detach":detach,"pull":pull,"sync_in_progress":repo.local("sync.json").exists(),"sync_pending":pending,"files":files,"opaque":manifest.opaque,"patterns":manifest.patterns,"base_changes":changes,"pull_blocked":blocked,"warnings":warnings,"problems":problems});
     if porcelain {
         let mut out = io::stdout().lock();
         serde_json::to_writer_pretty(&mut out, &report)?;
